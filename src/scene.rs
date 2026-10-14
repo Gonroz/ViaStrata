@@ -5,7 +5,7 @@
 //!
 //! * The node graph — every distinct point the design is built from.
 //! * The roads and pavements drawn on it.
-//! * The in-progress drafts.
+//! * The in-progress drafts, including the cross-section for the next road.
 //! * Per-scene interaction state (which node or handle is hovered or
 //!   being dragged).
 //!
@@ -13,20 +13,14 @@
 //! narrows `App` to camera, tools, and network. It also opens the door to
 //! multiple scenes later — before/after comparisons, projects with
 //! several locations — without fighting `App` for ownership.
-//!
-//! The interaction state is deliberately included even though it's
-//! transient: it references `NodeId` and `HandleRef`, which are scene
-//! concepts, and it needs to be cleared by scene mutations. Keeping it
-//! here means a single struct owns all "what is being edited and how" for
-//! one design.
 
 use std::collections::{HashMap, HashSet};
 
 use eframe::egui::{Pos2, Vec2};
 
 use crate::model::{
-    recompute_auto_handles, AnchorRef, CenterStyle, HandleRef, HandleSide, NodeGraph, NodeId,
-    PathAnchor, PathOwner, Pavement, Road,
+    default_two_way, recompute_auto_handles, AnchorRef, CenterStyle, HandleRef, HandleSide, Lane,
+    NodeGraph, NodeId, PathAnchor, PathOwner, Pavement, Road,
 };
 
 /// All design data plus per-scene interaction state.
@@ -38,11 +32,12 @@ pub struct Scene {
     pub current_road: Vec<PathAnchor>,
     pub current_pavement: Vec<PathAnchor>,
 
-    /// Lane count for the next committed road.
-    pub lanes: u32,
-    /// Lane width in meters for the next committed road.
-    pub lane_m: f32,
-    /// Center-line style for the next committed road.
+    /// Cross-section for the *next* committed road. Cloned into each new
+    /// `Road` at commit time, so existing roads keep their own lane list
+    /// even if the user edits this for the next one.
+    pub draft_lanes: Vec<Lane>,
+    /// Center-line style for the next committed road. Same copy-on-commit
+    /// semantics as `draft_lanes`.
     pub center_style: CenterStyle,
 
     // ----- Interaction -----------------------------------------------
@@ -65,9 +60,7 @@ impl Default for Scene {
             current_road: Vec::new(),
             current_pavement: Vec::new(),
 
-            lanes: 2,
-            // 11 ft is a common US lane width; store the metric truth once.
-            lane_m: 11.0 * 0.3048,
+            draft_lanes: default_two_way(),
             center_style: CenterStyle::YellowSolid,
 
             dragging: None,
@@ -83,7 +76,6 @@ impl Scene {
     // Queries
     // ============================================================
 
-    /// Resolves a road's anchors to positions for rendering.
     pub fn road_positions(&self, road: &Road) -> Vec<Pos2> {
         road.anchors
             .iter()
@@ -91,7 +83,6 @@ impl Scene {
             .collect()
     }
 
-    /// Position of a specific anchor, if it still exists.
     pub fn anchor_position(&self, r: AnchorRef) -> Option<Pos2> {
         let anchor = match r.owner {
             PathOwner::Road(i) => self.roads.get(i)?.anchors.get(r.index)?,
@@ -100,7 +91,6 @@ impl Scene {
         self.graph.pos(anchor.node)
     }
 
-    /// Full anchor struct, if it still exists.
     pub fn anchor(&self, r: AnchorRef) -> Option<&PathAnchor> {
         match r.owner {
             PathOwner::Road(i) => self.roads.get(i)?.anchors.get(r.index),
@@ -158,8 +148,7 @@ impl Scene {
     }
 
     /// Finds the nearest handle to `img_pt`. Roads are checked before
-    /// pavements so a road handle wins over a coincident pavement handle —
-    /// roads render on top, so hit-testing matches visual stacking.
+    /// pavements so a road handle wins over a coincident pavement handle.
     pub fn find_handle(&self, img_pt: Pos2, radius: f32) -> Option<HandleRef> {
         let r2 = radius * radius;
         for (i, road) in self.roads.iter().enumerate() {
@@ -243,16 +232,12 @@ impl Scene {
         self.graph.add(pos)
     }
 
-    /// Moves a node and refreshes auto handles for every path containing it.
     pub fn move_node(&mut self, id: NodeId, delta: Vec2) {
         if self.graph.move_by(id, delta) {
             self.refresh_auto_handles();
         }
     }
 
-    /// Moves one handle of one anchor. Clears the anchor's `auto` flag,
-    /// since the user has taken manual control. Unless `break_tangent`, the
-    /// opposite handle mirrors to keep the anchor smooth.
     pub fn move_handle(&mut self, href: HandleRef, delta: Vec2, break_tangent: bool) {
         let current = match self.anchor(href.anchor_ref()) {
             Some(a) => *a,
@@ -283,8 +268,8 @@ impl Scene {
         }
     }
 
-    /// Alt-drag on a node: instead of moving the node, pull out symmetric
-    /// direction handles from every anchor that references it.
+    /// Alt-drag on a node: pull out symmetric direction handles from every
+    /// anchor that references it.
     pub fn pull_out_handles(&mut self, node: NodeId, delta: Vec2) {
         for road in &mut self.roads {
             for a in &mut road.anchors {
@@ -306,7 +291,6 @@ impl Scene {
         }
     }
 
-    /// Deletes a node from every path, from the drafts, and from the graph.
     pub fn delete_node(&mut self, id: NodeId) {
         self.roads = split_roads_on_node(std::mem::take(&mut self.roads), id);
         self.pavements = split_pavements_on_node(std::mem::take(&mut self.pavements), id);
@@ -363,8 +347,6 @@ impl Scene {
         self.graph.gc(|id| used.contains(&id));
     }
 
-    /// Recomputes auto handles on every path after a node has moved, or
-    /// after a new anchor was inserted.
     pub fn refresh_auto_handles(&mut self) {
         let graph = &self.graph;
         for road in &mut self.roads {
@@ -381,7 +363,6 @@ impl Scene {
     // Draft lifecycle
     // ============================================================
 
-    /// Discards both drafts, cleaning up orphan nodes.
     pub fn discard_drafts(&mut self) {
         let road: Vec<PathAnchor> = std::mem::take(&mut self.current_road);
         let pa: Vec<PathAnchor> = std::mem::take(&mut self.current_pavement);
@@ -395,16 +376,17 @@ impl Scene {
     }
 
     /// Commits the current road draft into `roads` if it has at least two
-    /// distinct consecutive anchors. Otherwise discards it.
+    /// distinct consecutive anchors. The cross-section is cloned from
+    /// `draft_lanes`, so the user's edits apply to the next road without
+    /// retroactively changing existing ones.
     pub fn finish_road(&mut self) {
         let deduped = dedup_anchors(&self.current_road);
         self.current_road.clear();
 
-        if deduped.len() >= 2 {
+        if deduped.len() >= 2 && !self.draft_lanes.is_empty() {
             self.roads.push(Road {
                 anchors: deduped,
-                lanes: self.lanes,
-                lane_m: self.lane_m,
+                lanes: self.draft_lanes.clone(),
                 center: self.center_style,
             });
             self.refresh_auto_handles();
@@ -419,8 +401,6 @@ impl Scene {
         self.hover_handle = None;
     }
 
-    /// Commits the current pavement draft if it has at least three distinct
-    /// anchors. Otherwise discards it.
     pub fn finish_pavement(&mut self) {
         let deduped = dedup_anchors(&self.current_pavement);
         self.current_pavement.clear();
@@ -439,9 +419,6 @@ impl Scene {
         self.hover_handle = None;
     }
 
-    /// Primary click with the Road tool. Road anchors are *smooth*
-    /// (`PathAnchor::new`), so a click-click-click sequence produces a
-    /// Catmull-Rom-style curve.
     pub fn road_click(&mut self, img_pos: Pos2, snap: Option<NodeId>) {
         match (self.current_road.is_empty(), snap) {
             (true, Some(id)) => {
@@ -465,9 +442,6 @@ impl Scene {
         self.refresh_auto_handles();
     }
 
-    /// Primary click with the Pavement tool. Pavement anchors are *corners*
-    /// (`PathAnchor::new_corner`), so consecutive points produce straight
-    /// edges. Alt-drag a corner to round it.
     pub fn pavement_click(&mut self, img_pos: Pos2, snap: Option<NodeId>) {
         match (self.current_pavement.is_empty(), snap) {
             (true, Some(id)) => {
@@ -494,8 +468,6 @@ impl Scene {
         }
     }
 
-    /// Ctrl+Z. Pops the last anchor from an active draft first, then the
-    /// last committed road, then the last committed pavement.
     pub fn undo(&mut self) {
         if let Some(a) = self.current_road.pop() {
             self.remove_if_orphan(a.node);
@@ -516,7 +488,6 @@ impl Scene {
         self.hover_handle = None;
     }
 
-    /// Clears every road, pavement, draft, and node.
     pub fn clear_all_paths(&mut self) {
         self.roads.clear();
         self.pavements.clear();
@@ -534,7 +505,6 @@ impl Scene {
 // Free functions
 // ============================================================
 
-/// Projects `p` onto the line segment `a..b`, clamped to the endpoints.
 fn project_point_to_segment(p: Pos2, a: Pos2, b: Pos2) -> Pos2 {
     let ab = b - a;
     let len_sq = ab.length_sq();
@@ -545,7 +515,6 @@ fn project_point_to_segment(p: Pos2, a: Pos2, b: Pos2) -> Pos2 {
     a + ab * t
 }
 
-/// Removes consecutive duplicate anchors.
 fn dedup_anchors(anchors: &[PathAnchor]) -> Vec<PathAnchor> {
     let mut out: Vec<PathAnchor> = Vec::with_capacity(anchors.len());
     for &a in anchors {
@@ -556,7 +525,6 @@ fn dedup_anchors(anchors: &[PathAnchor]) -> Vec<PathAnchor> {
     out
 }
 
-/// Tests a single anchor's in and out handles for a hit within `r2`.
 fn handle_hit(
     graph: &NodeGraph,
     anchor: &PathAnchor,
@@ -587,7 +555,6 @@ fn handle_hit(
     None
 }
 
-/// Splits roads around a node being deleted.
 fn split_roads_on_node(roads: Vec<Road>, id: NodeId) -> Vec<Road> {
     let mut out = Vec::with_capacity(roads.len());
     for road in roads {
@@ -609,8 +576,7 @@ fn split_roads_on_node(roads: Vec<Road>, id: NodeId) -> Vec<Road> {
             if piece.len() >= 2 {
                 out.push(Road {
                     anchors: piece,
-                    lanes: road.lanes,
-                    lane_m: road.lane_m,
+                    lanes: road.lanes.clone(),
                     center: road.center,
                 });
             }
@@ -620,8 +586,7 @@ fn split_roads_on_node(roads: Vec<Road>, id: NodeId) -> Vec<Road> {
         if tail.len() >= 2 {
             out.push(Road {
                 anchors: tail,
-                lanes: road.lanes,
-                lane_m: road.lane_m,
+                lanes: road.lanes.clone(),
                 center: road.center,
             });
         }
@@ -629,7 +594,6 @@ fn split_roads_on_node(roads: Vec<Road>, id: NodeId) -> Vec<Road> {
     out
 }
 
-/// Splits pavements around a node being deleted.
 fn split_pavements_on_node(pavements: Vec<Pavement>, id: NodeId) -> Vec<Pavement> {
     let mut out = Vec::with_capacity(pavements.len());
     for pa in pavements {

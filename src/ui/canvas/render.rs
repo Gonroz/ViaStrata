@@ -11,7 +11,7 @@ use crate::model::{
     tessellate, AnchorRef, HandleRef, HandleSide, NodeId, PathAnchor, PathOwner, Tool,
 };
 use crate::ui::paint::{
-    paint_attribution, paint_pavement, paint_road_asphalt, paint_road_markings,
+    paint_attribution, paint_lane_tints, paint_pavement, paint_road_asphalt, paint_road_markings,
 };
 
 const SAMPLES_PER_SEGMENT: usize = 12;
@@ -46,11 +46,11 @@ pub fn draw(
         paint_pavement(painter, &polyline);
     }
 
-    // --- Road asphalt (pass 1: fill + joint fills) --------------------
+    // --- Road asphalt (pass 1: body + joint fills) --------------------
     for road in &app.scene.roads {
         let polyline_img = tessellate(&road.anchors, &app.scene.graph, false, SAMPLES_PER_SEGMENT);
         let screen: Vec<Pos2> = polyline_img.iter().map(|&p| x.to_screen(p)).collect();
-        let w = road.lane_m * road.lanes as f32 * ppm * x.zoom();
+        let w = road.total_width_m() * ppm * x.zoom();
         let joints: Vec<Pos2> = road
             .anchors
             .iter()
@@ -61,12 +61,23 @@ pub fn draw(
         paint_road_asphalt(painter, &screen, w, &joints);
     }
 
-    // --- Road markings (pass 2) ---------------------------------------
+    // --- Road tints and markings (pass 2) -----------------------------
+    //
+    // Split into two sub-passes so a lane tint never covers a marking
+    // drawn on an earlier road. In practice tints stop at the road's own
+    // anchors and don't extend across shared nodes, but two-pass is
+    // cheap and correct.
     for road in &app.scene.roads {
         let polyline_img = tessellate(&road.anchors, &app.scene.graph, false, SAMPLES_PER_SEGMENT);
         let screen: Vec<Pos2> = polyline_img.iter().map(|&p| x.to_screen(p)).collect();
-        let w = road.lane_m * road.lanes as f32 * ppm * x.zoom();
-        paint_road_markings(painter, &screen, w, road.lanes, road.center);
+        let w = road.total_width_m() * ppm * x.zoom();
+        paint_lane_tints(painter, &screen, w, &road.lanes);
+    }
+    for road in &app.scene.roads {
+        let polyline_img = tessellate(&road.anchors, &app.scene.graph, false, SAMPLES_PER_SEGMENT);
+        let screen: Vec<Pos2> = polyline_img.iter().map(|&p| x.to_screen(p)).collect();
+        let w = road.total_width_m() * ppm * x.zoom();
+        paint_road_markings(painter, &screen, w, &road.lanes, road.center);
     }
 
     // --- Draft pavement ------------------------------------------------
@@ -111,7 +122,7 @@ pub fn draw(
                 .unwrap_or(img);
             screen.push(x.to_screen(preview));
         }
-        let w = app.scene.lane_m * app.scene.lanes as f32 * ppm * x.zoom();
+        let w = crate::model::total_width_m(&app.scene.draft_lanes) * ppm * x.zoom();
         let joints: Vec<Pos2> = app
             .scene
             .current_road
@@ -121,7 +132,14 @@ pub fn draw(
             .map(|p| x.to_screen(p))
             .collect();
         paint_road_asphalt(painter, &screen, w, &joints);
-        paint_road_markings(painter, &screen, w, app.scene.lanes, app.scene.center_style);
+        paint_lane_tints(painter, &screen, w, &app.scene.draft_lanes);
+        paint_road_markings(
+            painter,
+            &screen,
+            w,
+            &app.scene.draft_lanes,
+            app.scene.center_style,
+        );
     }
 
     // --- Node handles + direction handles -----------------------------
@@ -146,8 +164,6 @@ pub fn draw(
     }
 }
 
-/// Paints every node handle, and — only for the anchor currently hovered or
-/// being dragged — that anchor's Bézier direction handles.
 fn paint_handles(app: &App, painter: &egui::Painter, x: &Xform, shared: &HashSet<NodeId>) {
     let base = Color32::from_rgb(220, 220, 220);
     let hover = Color32::from_rgb(255, 210, 80);
@@ -155,7 +171,6 @@ fn paint_handles(app: &App, painter: &egui::Painter, x: &Xform, shared: &HashSet
     let handle_line = Color32::from_rgb(140, 190, 255);
     let handle_dot = Color32::from_rgb(180, 220, 255);
 
-    // Which anchor's direction handles are visible this frame.
     let active_anchor = app
         .scene
         .dragging_handle
@@ -168,7 +183,6 @@ fn paint_handles(app: &App, painter: &egui::Painter, x: &Xform, shared: &HashSet
         .and_then(|id| anchor_owner_for_node(app, id))
         .or_else(|| active_anchor.map(|r| (r.owner, r.index)));
 
-    // --- Direction handles for the active anchor ----------------------
     if let Some((owner, idx)) = hover_anchor_owner {
         let href = AnchorRef { owner, index: idx };
         if let Some(anchor) = app.scene.anchor(href) {
@@ -189,7 +203,6 @@ fn paint_handles(app: &App, painter: &egui::Painter, x: &Xform, shared: &HashSet
         }
     }
 
-    // --- Node dots ----------------------------------------------------
     let mut seen: HashSet<NodeId> = HashSet::new();
     let mut paint_one = |id: NodeId| {
         if !seen.insert(id) {

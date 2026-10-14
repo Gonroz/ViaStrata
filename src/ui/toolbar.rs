@@ -88,6 +88,8 @@ fn location_row(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
     });
 }
 
+/// Row 3: controls for the active tool. Lane layout and center-line style
+/// now live in the sidebar; this row only carries actions.
 fn tool_row(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal(|ui| match app.tool {
         Tool::Calibrate => {
@@ -115,26 +117,7 @@ fn tool_row(app: &mut App, ui: &mut egui::Ui) {
             }
         }
         Tool::Road => {
-            let f = app.unit.to_m();
-            let suffix = format!(" {}", app.unit.label());
-
-            ui.label("Lanes:");
-            ui.add(egui::DragValue::new(&mut app.scene.lanes).range(1..=8));
-
-            ui.label("Lane width:");
-            let mut lane = app.scene.lane_m / f;
-            if ui
-                .add(
-                    egui::DragValue::new(&mut lane)
-                        .speed(0.1)
-                        .range(1.0..=60.0)
-                        .suffix(suffix),
-                )
-                .changed()
-            {
-                app.scene.lane_m = lane * f;
-            }
-
+            ui.label("Cross-section and markings are in the side panel →");
             ui.separator();
             if ui.button("Finish (Enter)").clicked() {
                 app.scene.finish_road();
