@@ -1,98 +1,36 @@
-//! Catmull-Rom spline tessellation for smooth road rendering.
+//! Curve math and tessellation helpers.
 //!
-//! Roads are stored as *sparse* control points — the exact pixels the user
-//! clicked. To render them we need a smooth curve that still passes through
-//! every one of those points. Catmull-Rom is ideal here because it is
-//! *interpolating* (unlike Bézier, where the middle control points sit off
-//! the curve), so the user's clicks remain the literal truth of the road.
+//! Everything on-screen is a cubic Bézier path. The Catmull-Rom behavior
+//! that used to live here for roads is now derived from Bézier form: the
+//! auto-handle computation in `model::path::recompute_auto_handles`
+//! converts a Catmull-Rom tangent into the equivalent Bézier control
+//! points, so a smooth road still has the same shape but goes through the
+//! same rendering code as pavements.
 //!
-//! For a segment P1→P2 with neighbours P0 (before) and P3 (after), uniform
-//! Catmull-Rom evaluates to:
-//!
-//!     C(t) = 0.5 * (
-//!           2*P1
-//!         + (-P0 + P2)                    * t
-//!         + (2*P0 - 5*P1 + 4*P2 - P3)     * t^2
-//!         + (-P0 + 3*P1 - 3*P2 + P3)      * t^3
-//!     )
-//!
-//! The curve is C1-continuous, which is why adjoining segments meet without
-//! a visible corner even if the user draws a sharp turn.
-//!
-//! Endpoints are handled by *clamping* the out-of-range neighbours to the
-//! nearest real point. That is the standard trick for making the curve start
-//! and end with a sensible tangent without asking the user for handle points.
+//! Also here: `offset_polyline`, used by lane-marking rendering, and
+//! `ear_clip`, used by pavement fill.
 
 use eframe::egui::{Pos2, Vec2};
 
-/// Straight-line samples per control-point span. Higher = smoother geometry
-/// but more vertices pushed to the painter every frame. 12 is a good balance
-/// for road widths that rarely exceed a few hundred screen pixels: the corner
-/// cut at a typical join is well under a pixel.
-const SAMPLES_PER_SEGMENT: usize = 12;
-
-/// Tessellates a Catmull-Rom spline through `pts` into a dense polyline.
+/// Evaluates a cubic Bézier at parameter `t` in `[0, 1]`.
 ///
-/// * 0 or 1 point  -> returned unchanged (nothing to interpolate).
-/// * 2 points      -> returned unchanged; two control points cannot define a
-///                    curve, so the caller gets a straight segment.
-/// * 3+ points     -> `(pts.len() - 1) * SAMPLES_PER_SEGMENT + 1` points,
-///                    including both original endpoints.
-///
-/// The output is in the same coordinate space as the input (image pixels or
-/// screen pixels — the caller decides), so this function has no opinion about
-/// transforms.
-pub fn catmull_rom(pts: &[Pos2]) -> Vec<Pos2> {
-    // Below three points there is no curve to draw.
-    if pts.len() < 3 {
-        return pts.to_vec();
-    }
-
-    let n = pts.len() as isize;
-    let mut out = Vec::with_capacity((pts.len() - 1) * SAMPLES_PER_SEGMENT + 1);
-
-    // Index helper that clamps to the valid range. This gives the first and
-    // last segments a "phantom" neighbour equal to the endpoint, which is
-    // what makes the tangents behave correctly at the ends of the road.
-    let get = |i: isize| -> Pos2 { pts[i.clamp(0, n - 1) as usize] };
-
-    // Emit the first point once, then sample each segment without re-emitting
-    // its start (that's the previous segment's t=1).
-    out.push(pts[0]);
-
-    for i in 0..pts.len() - 1 {
-        let p0 = get(i as isize - 1);
-        let p1 = get(i as isize);
-        let p2 = get(i as isize + 1);
-        let p3 = get(i as isize + 2);
-
-        for s in 1..=SAMPLES_PER_SEGMENT {
-            let t = s as f32 / SAMPLES_PER_SEGMENT as f32;
-            out.push(catmull_rom_point(p0, p1, p2, p3, t));
-        }
-    }
-
-    out
-}
-
-/// Evaluates the uniform Catmull-Rom basis at `t` in `[0, 1]`. The curve
-/// passes through `p1` at `t = 0` and `p2` at `t = 1`.
-///
-/// The four basis polynomials below come from expanding the matrix form of
-/// the Catmull-Rom basis given in the module docs. They are applied
-/// component-wise to x and y.
-fn catmull_rom_point(p0: Pos2, p1: Pos2, p2: Pos2, p3: Pos2, t: f32) -> Pos2 {
+/// `c1` and `c2` are the two control points; `p0` and `p3` are the endpoints.
+/// The curve passes through `p0` at `t=0` and `p3` at `t=1`, and its tangent
+/// at `p0` points toward `c1` (scaled by 3×, which is the standard Bézier
+/// derivative).
+pub fn cubic_bezier_point(p0: Pos2, c1: Pos2, c2: Pos2, p3: Pos2, t: f32) -> Pos2 {
+    let mt = 1.0 - t;
+    let mt2 = mt * mt;
     let t2 = t * t;
-    let t3 = t2 * t;
 
-    let b0 = -0.5 * t3 + t2 - 0.5 * t; // weight of P0
-    let b1 = 1.5 * t3 - 2.5 * t2 + 1.0; // weight of P1
-    let b2 = -1.5 * t3 + 2.0 * t2 + 0.5 * t; // weight of P2
-    let b3 = 0.5 * t3 - 0.5 * t2; // weight of P3
+    let a = mt2 * mt; // (1-t)^3
+    let b = 3.0 * mt2 * t;
+    let c = 3.0 * mt * t2;
+    let d = t2 * t;
 
     Pos2::new(
-        b0 * p0.x + b1 * p1.x + b2 * p2.x + b3 * p3.x,
-        b0 * p0.y + b1 * p1.y + b2 * p2.y + b3 * p3.y,
+        a * p0.x + b * c1.x + c * c2.x + d * p3.x,
+        a * p0.y + b * c1.y + c * c2.y + d * p3.y,
     )
 }
 
@@ -100,18 +38,12 @@ fn catmull_rom_point(p0: Pos2, p1: Pos2, p2: Pos2, p3: Pos2, t: f32) -> Pos2 {
 /// when walking along the polyline in drawing order, in a y-down coordinate
 /// system).
 ///
-/// Used to draw lane markings: the asphalt is a thick stroke on the
-/// centerline, and each lane divider or edge line is a thin stroke on a
-/// parallel polyline offset by a fixed distance.
+/// Used to draw lane markings on a polyline parallel to the road centerline.
 ///
-/// The offset is *naive* — it moves each vertex along its own normal, which
-/// means sharp corners self-intersect. That's fine here because the input is
-/// always a densely tessellated spline, where consecutive vertices are close
-/// enough that the naive offset is visually indistinguishable from a proper
-/// miter join.
-///
-/// Vertices with no well-defined tangent (isolated points, or duplicated
-/// positions) are passed through unmodified rather than being moved to NaN.
+/// The offset is *naive* — each vertex moves along its own normal, so sharp
+/// corners self-intersect. That is fine here because the input is always a
+/// densely tessellated spline: consecutive vertices are close enough that
+/// the naive offset is visually indistinguishable from a proper miter.
 pub fn offset_polyline(pts: &[Pos2], offset: f32) -> Vec<Pos2> {
     if pts.len() < 2 {
         return pts.to_vec();
@@ -120,10 +52,6 @@ pub fn offset_polyline(pts: &[Pos2], offset: f32) -> Vec<Pos2> {
     let mut out = Vec::with_capacity(n);
 
     for i in 0..n {
-        // Tangent direction: forward difference at the start, backward
-        // difference at the end, and the average of the two neighbouring
-        // unit vectors elsewhere (which gives a smoother direction around
-        // bends than either single segment would).
         let tangent: Vec2 = if i == 0 {
             pts[1] - pts[0]
         } else if i == n - 1 {
@@ -144,19 +72,126 @@ pub fn offset_polyline(pts: &[Pos2], offset: f32) -> Vec<Pos2> {
 
         let len = tangent.length();
         if len < 1e-6 {
-            // Degenerate tangent; leave the vertex where it is rather than
-            // producing a NaN by dividing by zero.
             out.push(pts[i]);
             continue;
         }
 
         let t = tangent / len;
-        // Rotate 90° to get the normal. In egui's y-down coordinate system
-        // this points to the right of travel, which is why the caller's
-        // positive offset ends up on the "left" side when read top-to-bottom.
         let normal = Vec2::new(-t.y, t.x);
         out.push(pts[i] + normal * offset);
     }
 
     out
+}
+
+/// Triangulates a simple polygon into a list of triangle indices.
+///
+/// Uses the classic ear-clipping algorithm: repeatedly find a convex vertex
+/// ("ear") whose triangle contains no other polygon vertex, cut it off, and
+/// recurse on the remainder. Works on any simple polygon — convex or
+/// concave — but not self-intersecting.
+///
+/// Returns indices into `points`. If the polygon is degenerate (fewer than
+/// three points, all collinear, or self-intersecting), returns an empty or
+/// partial list rather than looping forever.
+///
+/// # Caller contract
+///
+/// The input must not repeat its first point at the end. A duplicated
+/// vertex creates a zero-length edge, which the "is this an ear?" test
+/// treats as having zero area and rejects, causing the algorithm to bail
+/// partway through. `paint_pavement` trims the duplicate before calling.
+pub fn ear_clip(points: &[Pos2]) -> Vec<[u32; 3]> {
+    let n = points.len();
+    if n < 3 {
+        return Vec::new();
+    }
+
+    let mut indices: Vec<usize> = (0..n).collect();
+
+    let signed_area: f32 = (0..n)
+        .map(|i| {
+            let j = (i + 1) % n;
+            points[i].x * points[j].y - points[j].x * points[i].y
+        })
+        .sum();
+    let ccw = signed_area > 0.0;
+
+    let mut triangles: Vec<[u32; 3]> = Vec::with_capacity(n.saturating_sub(2));
+
+    // Bound iterations: each successful clip removes one vertex, so a
+    // simple polygon needs exactly n-2 clips. If we exceed n * n attempts,
+    // something is wrong (self-intersecting input) and we bail.
+    let mut safety = n * n;
+
+    while indices.len() > 3 && safety > 0 {
+        safety -= 1;
+        let m = indices.len();
+        let mut clipped = false;
+
+        for i in 0..m {
+            let prev = indices[(i + m - 1) % m];
+            let cur = indices[i];
+            let next = indices[(i + 1) % m];
+
+            let a = points[prev];
+            let b = points[cur];
+            let c = points[next];
+
+            // Convex corner in the polygon's winding direction?
+            let cross = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+            let convex = if ccw { cross > 0.0 } else { cross < 0.0 };
+            if !convex {
+                continue;
+            }
+
+            // No other vertex may lie inside the ear triangle.
+            let mut contains_other = false;
+            for (k, &other) in indices.iter().enumerate() {
+                if k == i || other == prev || other == cur || other == next {
+                    continue;
+                }
+                if point_in_triangle(points[other], a, b, c) {
+                    contains_other = true;
+                    break;
+                }
+            }
+            if contains_other {
+                continue;
+            }
+
+            triangles.push([prev as u32, cur as u32, next as u32]);
+            indices.remove(i);
+            clipped = true;
+            break;
+        }
+
+        if !clipped {
+            // No ear found. Degenerate or self-intersecting; stop rather
+            // than loop forever.
+            break;
+        }
+    }
+
+    if indices.len() == 3 {
+        triangles.push([indices[0] as u32, indices[1] as u32, indices[2] as u32]);
+    }
+
+    triangles
+}
+
+/// Tests whether `p` lies inside triangle `(a, b, c)`.
+///
+/// Uses the sign of the cross product on each edge. Works for either
+/// winding because we accept a point as inside if all three edge tests
+/// agree, regardless of whether they are all positive or all negative.
+fn point_in_triangle(p: Pos2, a: Pos2, b: Pos2, c: Pos2) -> bool {
+    let d1 = (p.x - b.x) * (a.y - b.y) - (a.x - b.x) * (p.y - b.y);
+    let d2 = (p.x - c.x) * (b.y - c.y) - (b.x - c.x) * (p.y - c.y);
+    let d3 = (p.x - a.x) * (c.y - a.y) - (c.x - a.x) * (p.y - a.y);
+
+    let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+
+    !(has_neg && has_pos)
 }

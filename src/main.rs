@@ -4,7 +4,8 @@ mod app;
 mod geo;
 mod imagery;
 mod model;
-mod spline;   // <- new: Catmull-Rom tessellation for road curves
+mod scene;
+mod spline;
 mod ui;
 
 use eframe::egui;

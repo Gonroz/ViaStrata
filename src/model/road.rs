@@ -1,6 +1,6 @@
 //! Roads and their marking styles.
 
-use super::NodeId;
+use super::path::PathAnchor;
 
 /// How the center of a two-way road is marked.
 ///
@@ -31,12 +31,11 @@ impl CenterStyle {
     }
 }
 
-/// A road is a sequence of *node references* plus real-world width and
-/// marking style. The actual positions live in `NodeGraph`, which is what
-/// makes two roads that share a node stay glued together when that node is
-/// dragged.
+/// A road is a sequence of path anchors plus real-world width and marking
+/// style. Width is derived per frame from `lane_m × lanes × px_per_m × zoom`,
+/// so a road keeps its physical size at any zoom.
 pub struct Road {
-    pub nodes: Vec<NodeId>,
+    pub anchors: Vec<PathAnchor>,
     pub lanes: u32,
     pub lane_m: f32,
     pub center: CenterStyle,

@@ -20,7 +20,6 @@ pub fn show_status(app: &App, ctx: &egui::Context) {
     });
 }
 
-/// Row 1: open image, tool picker, units, scale readout.
 fn image_row(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         if ui.button("Open image…").clicked() {
@@ -29,7 +28,8 @@ fn image_row(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
         ui.separator();
         ui.selectable_value(&mut app.tool, Tool::Pan, "Pan");
         ui.selectable_value(&mut app.tool, Tool::Calibrate, "Calibrate scale");
-        ui.selectable_value(&mut app.tool, Tool::Road, "Draw road");
+        ui.selectable_value(&mut app.tool, Tool::Road, "Road");
+        ui.selectable_value(&mut app.tool, Tool::Pavement, "Pavement");
         ui.separator();
         ui.label("Units:");
         ui.selectable_value(&mut app.unit, Unit::Feet, "ft");
@@ -47,7 +47,6 @@ fn image_row(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
     });
 }
 
-/// Row 2: coordinates + satellite source settings.
 fn location_row(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.label("Location:");
@@ -58,8 +57,6 @@ fn location_row(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
         );
         let enter_in_field = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
-        // Source picker. Each button shows the source's human label so new
-        // variants only need to be added to `Source::label`, not here.
         for src in [Source::Esri, Source::EsriClarity, Source::Usgs] {
             ui.selectable_value(&mut app.source, src, src.label());
         }
@@ -91,11 +88,6 @@ fn location_row(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
     });
 }
 
-/// Row 3: controls for the active tool.
-///
-/// The center-line style picker lives in the side panel (see `ui::sidebar`)
-/// rather than here, because it wants a visual preview that a toolbar row
-/// can't accommodate.
 fn tool_row(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal(|ui| match app.tool {
         Tool::Calibrate => {
@@ -127,10 +119,10 @@ fn tool_row(app: &mut App, ui: &mut egui::Ui) {
             let suffix = format!(" {}", app.unit.label());
 
             ui.label("Lanes:");
-            ui.add(egui::DragValue::new(&mut app.lanes).range(1..=8));
+            ui.add(egui::DragValue::new(&mut app.scene.lanes).range(1..=8));
 
             ui.label("Lane width:");
-            let mut lane = app.lane_m / f;
+            let mut lane = app.scene.lane_m / f;
             if ui
                 .add(
                     egui::DragValue::new(&mut lane)
@@ -140,18 +132,31 @@ fn tool_row(app: &mut App, ui: &mut egui::Ui) {
                 )
                 .changed()
             {
-                app.lane_m = lane * f;
+                app.scene.lane_m = lane * f;
             }
 
             ui.separator();
             if ui.button("Finish (Enter)").clicked() {
-                app.finish_road();
+                app.scene.finish_road();
             }
             if ui.button("Undo (Ctrl+Z)").clicked() {
-                app.undo();
+                app.scene.undo();
             }
             if ui.button("Clear all").clicked() {
-                app.clear_all_roads();
+                app.scene.clear_all_paths();
+            }
+        }
+        Tool::Pavement => {
+            ui.label("Click to add corners. Click the first corner again to close the shape.");
+            ui.separator();
+            if ui.button("Finish (Enter)").clicked() {
+                app.scene.finish_pavement();
+            }
+            if ui.button("Undo (Ctrl+Z)").clicked() {
+                app.scene.undo();
+            }
+            if ui.button("Clear all").clicked() {
+                app.scene.clear_all_paths();
             }
         }
         Tool::Pan => {

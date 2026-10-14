@@ -3,6 +3,10 @@
 //! Split from input and render because the camera's lifetime is different:
 //! it survives image reloads and is modified by both mouse gestures (zoom,
 //! pan) and keyboard (WASD). It lives on `App` as `app.view`.
+//!
+//! Image upload also lives here rather than on `App`, because the texture
+//! handle *is* part of the view state and the unique-name counter that
+//! guarantees a clean re-upload belongs right next to it.
 
 use eframe::egui::{self, PointerButton, Rect, TextureHandle, Vec2};
 
@@ -23,14 +27,59 @@ pub struct View {
     /// Set when a new image is loaded; the canvas consumes it on the next
     /// frame to fit the image to the viewport exactly once.
     pub fit_pending: bool,
+
+    /// Counter for generating unique texture names.
+    ///
+    /// Every `install_image` call uses a fresh name like `base_3`, `base_4`,
+    /// and so on. That forces egui to fully free the previous GPU texture
+    /// and allocate a new one, which is important for two reasons:
+    ///
+    /// * **Mipmaps.** egui's in-place texture update path re-uploads the
+    ///   pixel data but doesn't reliably rebuild the mipmap chain. Without
+    ///   fresh mipmaps, the minified view (i.e. the fit-to-window zoom)
+    ///   looks soft and aliased, because the GPU has to sample the
+    ///   full-resolution texture with a low-quality filter.
+    ///
+    /// * **Size changes.** If a new fetch returns an image of a different
+    ///   size — because the user changed zoom, radius, or source — updating
+    ///   in place leaves the size metadata and the actual pixel buffer
+    ///   briefly out of sync. A fresh allocation avoids that entirely.
+    ///
+    /// The cost is one extra texture allocation per load, which is nothing.
+    next_tex_name: u32,
 }
 
 impl View {
-    /// Installs a fresh texture and schedules a one-shot fit-to-window on
-    /// the next frame. Called by `App::set_base`.
-    pub fn reset_for_new_image(&mut self, tex: TextureHandle, size: Vec2) {
-        self.tex = Some(tex);
-        self.img_size = size;
+    /// Installs a fresh image as the base layer.
+    ///
+    /// Uploads the pixels under a unique texture name, resets the camera to
+    /// `zoom = 1` at offset zero, and schedules a one-shot fit-to-window
+    /// for the next frame. The fit is what gives a freshly loaded image a
+    /// crisp, centered display that matches its actual pixel dimensions.
+    pub fn install_image(&mut self, ctx: &egui::Context, img: &image::RgbaImage) {
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let ci = egui::ColorImage::from_rgba_unmultiplied([w, h], img.as_raw());
+
+        // Linear minification with a mipmap chain keeps the fit-to-window
+        // view crisp. Linear magnification keeps pixel-level zoom smooth
+        // rather than blocky. Clamp-to-edge avoids a visible border seam
+        // when the image is displayed at exactly 1:1 and a sample lands on
+        // the edge texel.
+        let tex_opts = egui::TextureOptions {
+            magnification: egui::TextureFilter::Linear,
+            minification: egui::TextureFilter::Linear,
+            wrap_mode: egui::TextureWrapMode::ClampToEdge,
+            mipmap_mode: Some(egui::TextureFilter::Linear),
+        };
+
+        let name = format!("base_{}", self.next_tex_name);
+        self.next_tex_name = self.next_tex_name.wrapping_add(1);
+
+        // Assigning to `self.tex` drops the previous `TextureHandle`, which
+        // tells egui to free the old GPU texture. Combined with the unique
+        // name, that guarantees the new texture starts from a clean slate.
+        self.tex = Some(ctx.load_texture(name, ci, tex_opts));
+        self.img_size = Vec2::new(w as f32, h as f32);
         self.zoom = 1.0;
         self.offset = Vec2::ZERO;
         self.fit_pending = true;
@@ -94,8 +143,6 @@ pub fn apply_wasd(app: &mut App, ctx: &egui::Context) {
         return;
     }
 
-    // Read direction + delta-time in one closure to avoid holding a borrow
-    // across the mutation below.
     let (dir, dt) = ctx.input(|i| {
         let mut d = Vec2::ZERO;
         if i.key_down(egui::Key::W) {

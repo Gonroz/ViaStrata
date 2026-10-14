@@ -1,8 +1,4 @@
 //! Drawing the scene with the current camera.
-//!
-//! This module knows nothing about input. It reads App state, transforms
-//! through the `Xform`, and paints. Any hit-testing is a *query* on App
-//! (see `find_node`, `shared_nodes`), not a mutation.
 
 use std::collections::HashSet;
 
@@ -11,17 +7,17 @@ use eframe::egui::{self, pos2, Color32, Pos2, Rect, Stroke};
 use super::input::NODE_HIT_RADIUS_PX;
 use super::Xform;
 use crate::app::App;
-use crate::model::{NodeId, Tool};
-use crate::spline;
-use crate::ui::paint::{paint_attribution, paint_road, paint_road_asphalt, paint_road_markings};
+use crate::model::{
+    tessellate, AnchorRef, HandleRef, HandleSide, NodeId, PathAnchor, PathOwner, Tool,
+};
+use crate::ui::paint::{
+    paint_attribution, paint_pavement, paint_road_asphalt, paint_road_markings,
+};
 
-/// Visual radius of a rendered node handle in screen pixels.
+const SAMPLES_PER_SEGMENT: usize = 12;
 const HANDLE_RADIUS: f32 = 4.0;
-
-/// Visual radius of the ring drawn around a *shared* node — one referenced
-/// by two or more roads. Bigger than `HANDLE_RADIUS` so the ring reads as a
-/// distinct visual layer rather than a thickened outline.
 const SHARED_RING_RADIUS: f32 = HANDLE_RADIUS + 3.5;
+const DIR_HANDLE_RADIUS: f32 = 3.5;
 
 pub fn draw(
     app: &App,
@@ -30,7 +26,6 @@ pub fn draw(
     x: &Xform,
     rect: Rect,
 ) {
-    // Base image.
     if let Some(tex) = &app.view.tex {
         let r = Rect::from_min_size(x.to_screen(Pos2::ZERO), app.view.img_size * x.zoom());
         painter.image(
@@ -41,84 +36,100 @@ pub fn draw(
         );
     }
 
-    // Fall back to 1 px/m if scale isn't set yet — only matters for the
-    // draft preview, which can't be sized correctly without it.
     let ppm = app.px_per_m.unwrap_or(1.0);
+    let shared = app.scene.shared_nodes();
 
-    // Nodes shared by two or more roads (or by the draft and a committed
-    // road) get a joint fill and a ring around their handle. Computed once
-    // per frame.
-    let shared = app.shared_nodes();
+    // --- Pavements (under everything) ---------------------------------
+    for pa in &app.scene.pavements {
+        let polyline_img = tessellate(&pa.anchors, &app.scene.graph, true, SAMPLES_PER_SEGMENT);
+        let polyline: Vec<Pos2> = polyline_img.iter().map(|&p| x.to_screen(p)).collect();
+        paint_pavement(painter, &polyline);
+    }
 
-    // Pass 1: all asphalt, including joint fills. Doing all asphalt before
-    // any markings means a joint fill never covers another road's lane
-    // lines, and a later road doesn't erase an earlier one's asphalt at a
-    // shared vertex.
-    for road in &app.roads {
-        let pos = app.road_positions(road);
-        let smooth = spline::catmull_rom(&pos);
-        let screen: Vec<Pos2> = smooth.iter().map(|&p| x.to_screen(p)).collect();
+    // --- Road asphalt (pass 1: fill + joint fills) --------------------
+    for road in &app.scene.roads {
+        let polyline_img = tessellate(&road.anchors, &app.scene.graph, false, SAMPLES_PER_SEGMENT);
+        let screen: Vec<Pos2> = polyline_img.iter().map(|&p| x.to_screen(p)).collect();
         let w = road.lane_m * road.lanes as f32 * ppm * x.zoom();
         let joints: Vec<Pos2> = road
-            .nodes
+            .anchors
             .iter()
-            .filter(|id| shared.contains(id))
-            .filter_map(|id| app.graph.pos(*id))
+            .filter(|a| shared.contains(&a.node))
+            .filter_map(|a| app.scene.graph.pos(a.node))
             .map(|p| x.to_screen(p))
             .collect();
         paint_road_asphalt(painter, &screen, w, &joints);
     }
 
-    // Pass 2: all markings.
-    for road in &app.roads {
-        let pos = app.road_positions(road);
-        let smooth = spline::catmull_rom(&pos);
-        let screen: Vec<Pos2> = smooth.iter().map(|&p| x.to_screen(p)).collect();
+    // --- Road markings (pass 2) ---------------------------------------
+    for road in &app.scene.roads {
+        let polyline_img = tessellate(&road.anchors, &app.scene.graph, false, SAMPLES_PER_SEGMENT);
+        let screen: Vec<Pos2> = polyline_img.iter().map(|&p| x.to_screen(p)).collect();
         let w = road.lane_m * road.lanes as f32 * ppm * x.zoom();
         paint_road_markings(painter, &screen, w, road.lanes, road.center);
     }
 
-    // Draft road, on top of committed roads. Preview segment to the cursor
-    // goes to the snapped node if the cursor is over one, or to the raw
-    // cursor position otherwise — so the preview shows exactly what will
-    // happen if you click.
-    if !app.current.is_empty() {
-        let mut ctrl = app.draft_positions();
+    // --- Draft pavement ------------------------------------------------
+    if !app.scene.current_pavement.is_empty() {
+        let anchors = app.scene.current_pavement.clone();
+        let polyline_img = tessellate(&anchors, &app.scene.graph, false, SAMPLES_PER_SEGMENT);
+        let mut screen: Vec<Pos2> = polyline_img.iter().map(|&p| x.to_screen(p)).collect();
         if let Some(h) = resp.hover_pos() {
             let img = x.to_image(h);
-            let preview_target = app
+            let preview = app
+                .scene
                 .find_node(img, x.screen_dist_to_image(NODE_HIT_RADIUS_PX))
-                .and_then(|id| app.graph.pos(id))
+                .and_then(|id| app.scene.graph.pos(id))
                 .unwrap_or(img);
-            ctrl.push(preview_target);
+            screen.push(x.to_screen(preview));
+            if let Some(first) = app
+                .scene
+                .current_pavement
+                .first()
+                .and_then(|a| app.scene.graph.pos(a.node))
+            {
+                screen.push(x.to_screen(first));
+            }
         }
-        let smooth = spline::catmull_rom(&ctrl);
-        let screen: Vec<Pos2> = smooth.iter().map(|&p| x.to_screen(p)).collect();
-        let w = app.lane_m * app.lanes as f32 * ppm * x.zoom();
-        let joints: Vec<Pos2> = app
-            .current
-            .iter()
-            .filter(|id| shared.contains(id))
-            .filter_map(|id| app.graph.pos(*id))
-            .map(|p| x.to_screen(p))
-            .collect();
-        paint_road(
-            painter,
-            &screen,
-            w,
-            app.lanes,
-            app.center_style,
-            &joints,
-        );
+        painter.add(egui::Shape::line(
+            screen,
+            Stroke::new(2.0_f32, Color32::from_rgb(120, 170, 230)),
+        ));
     }
 
-    // Node handles. Drawn last so they sit on top, and only for the Road
-    // tool so they don't clutter Pan/Calibrate.
-    if app.tool == Tool::Road {
+    // --- Draft road ----------------------------------------------------
+    if !app.scene.current_road.is_empty() {
+        let anchors = app.scene.current_road.clone();
+        let polyline_img = tessellate(&anchors, &app.scene.graph, false, SAMPLES_PER_SEGMENT);
+        let mut screen: Vec<Pos2> = polyline_img.iter().map(|&p| x.to_screen(p)).collect();
+        if let Some(h) = resp.hover_pos() {
+            let img = x.to_image(h);
+            let preview = app
+                .scene
+                .find_node(img, x.screen_dist_to_image(NODE_HIT_RADIUS_PX))
+                .and_then(|id| app.scene.graph.pos(id))
+                .unwrap_or(img);
+            screen.push(x.to_screen(preview));
+        }
+        let w = app.scene.lane_m * app.scene.lanes as f32 * ppm * x.zoom();
+        let joints: Vec<Pos2> = app
+            .scene
+            .current_road
+            .iter()
+            .filter(|a| shared.contains(&a.node))
+            .filter_map(|a| app.scene.graph.pos(a.node))
+            .map(|p| x.to_screen(p))
+            .collect();
+        paint_road_asphalt(painter, &screen, w, &joints);
+        paint_road_markings(painter, &screen, w, app.scene.lanes, app.scene.center_style);
+    }
+
+    // --- Node handles + direction handles -----------------------------
+    if matches!(app.tool, Tool::Road | Tool::Pavement) {
         paint_handles(app, painter, x, &shared);
     }
 
-    // Calibration markers.
+    // --- Calibration --------------------------------------------------
     if !app.calib_pts.is_empty() {
         let red = Color32::from_rgb(235, 60, 60);
         let pts: Vec<Pos2> = app.calib_pts.iter().map(|&p| x.to_screen(p)).collect();
@@ -135,51 +146,137 @@ pub fn draw(
     }
 }
 
-/// Paints a handle dot for every node in the graph.
-///
-/// Two visual states:
-///
-/// * **Solo node** (referenced by exactly one road): a small filled dot
-///   with a thin black outline. This is a road's own control point.
-/// * **Shared node** (referenced by two or more roads): the same dot *plus*
-///   a ring at `SHARED_RING_RADIUS`, drawn in the same colour as the fill.
-///   The ring reads as a "bullseye" — a visually distinct shape without
-///   introducing a new colour that would compete with the yellow hover
-///   highlight.
-///
-/// Deduplicates by `NodeId` so a shared node's handle is painted exactly
-/// once even if many roads reference it.
+/// Paints every node handle, and — only for the anchor currently hovered or
+/// being dragged — that anchor's Bézier direction handles.
 fn paint_handles(app: &App, painter: &egui::Painter, x: &Xform, shared: &HashSet<NodeId>) {
     let base = Color32::from_rgb(220, 220, 220);
     let hover = Color32::from_rgb(255, 210, 80);
     let outline = Color32::from_black_alpha(160);
+    let handle_line = Color32::from_rgb(140, 190, 255);
+    let handle_dot = Color32::from_rgb(180, 220, 255);
 
+    // Which anchor's direction handles are visible this frame.
+    let active_anchor = app
+        .scene
+        .dragging_handle
+        .map(|h| h.anchor_ref())
+        .or_else(|| app.scene.hover_handle.map(|h| h.anchor_ref()));
+
+    let hover_anchor_owner: Option<(PathOwner, usize)> = app
+        .scene
+        .hover_node
+        .and_then(|id| anchor_owner_for_node(app, id))
+        .or_else(|| active_anchor.map(|r| (r.owner, r.index)));
+
+    // --- Direction handles for the active anchor ----------------------
+    if let Some((owner, idx)) = hover_anchor_owner {
+        let href = AnchorRef { owner, index: idx };
+        if let Some(anchor) = app.scene.anchor(href) {
+            if let Some(pos) = app.scene.anchor_position(href) {
+                let s = x.to_screen(pos);
+                draw_direction_handles(
+                    painter,
+                    x,
+                    anchor,
+                    s,
+                    handle_line,
+                    handle_dot,
+                    app.scene.hover_handle,
+                    owner,
+                    idx,
+                );
+            }
+        }
+    }
+
+    // --- Node dots ----------------------------------------------------
     let mut seen: HashSet<NodeId> = HashSet::new();
     let mut paint_one = |id: NodeId| {
         if !seen.insert(id) {
             return;
         }
-        let Some(p) = app.graph.pos(id) else { return };
-        let fill = if app.hover_node == Some(id) { hover } else { base };
+        let Some(p) = app.scene.graph.pos(id) else { return };
+        let fill = if app.scene.hover_node == Some(id) { hover } else { base };
         let s = x.to_screen(p);
 
-        // Ring first so the fill sits on top of it. The ring uses the same
-        // colour as the fill, so it tracks hover automatically.
         if shared.contains(&id) {
             painter.circle_stroke(s, SHARED_RING_RADIUS, Stroke::new(2.0_f32, fill));
         }
-
         painter.circle_filled(s, HANDLE_RADIUS, fill);
         painter.circle_stroke(s, HANDLE_RADIUS, Stroke::new(1.0_f32, outline));
     };
 
-    // Draft first so its handle wins the highlight on a tie.
-    for &id in &app.current {
-        paint_one(id);
+    for a in &app.scene.current_road {
+        paint_one(a.node);
     }
-    for road in &app.roads {
-        for &id in &road.nodes {
-            paint_one(id);
+    for a in &app.scene.current_pavement {
+        paint_one(a.node);
+    }
+    for road in &app.scene.roads {
+        for a in &road.anchors {
+            paint_one(a.node);
         }
     }
+    for pa in &app.scene.pavements {
+        for a in &pa.anchors {
+            paint_one(a.node);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_direction_handles(
+    painter: &egui::Painter,
+    x: &Xform,
+    anchor: &PathAnchor,
+    anchor_screen: Pos2,
+    line_color: Color32,
+    dot_color: Color32,
+    hover_handle: Option<HandleRef>,
+    owner: PathOwner,
+    anchor_index: usize,
+) {
+    let draw_one = |offset: eframe::egui::Vec2, side: HandleSide| {
+        if offset.length_sq() < 1e-6 {
+            return;
+        }
+        let end = anchor_screen + offset * x.zoom();
+        painter.line_segment([anchor_screen, end], Stroke::new(1.0_f32, line_color));
+
+        let is_hovered = hover_handle
+            .map(|h| h.owner == owner && h.anchor_index == anchor_index && h.side == side)
+            .unwrap_or(false);
+        let r = if is_hovered {
+            DIR_HANDLE_RADIUS + 1.0
+        } else {
+            DIR_HANDLE_RADIUS
+        };
+        painter.circle_filled(end, r, dot_color);
+        painter.circle_stroke(
+            end,
+            r,
+            Stroke::new(1.0_f32, Color32::from_black_alpha(160)),
+        );
+    };
+
+    draw_one(anchor.in_handle, HandleSide::In);
+    draw_one(anchor.out_handle, HandleSide::Out);
+}
+
+fn anchor_owner_for_node(app: &App, id: NodeId) -> Option<(PathOwner, usize)> {
+    for (i, road) in app.scene.roads.iter().enumerate() {
+        for (ai, a) in road.anchors.iter().enumerate() {
+            if a.node == id {
+                return Some((PathOwner::Road(i), ai));
+            }
+        }
+    }
+    for (i, pa) in app.scene.pavements.iter().enumerate() {
+        for (ai, a) in pa.anchors.iter().enumerate() {
+            if a.node == id {
+                return Some((PathOwner::Pavement(i), ai));
+            }
+        }
+    }
+    None
 }

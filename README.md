@@ -69,27 +69,31 @@ panning is middle-drag or WASD only.
 ## Layout
 
 `src/
-├── main.rs entry point, window setup
-├── app.rs App state, high-level operations, update loop
-├── geo.rs Web-Mercator math, "lat, lon" parsing
-├── imagery.rs tile sources, download, stitch, crop
-├── spline.rs Catmull-Rom tessellation + polyline offset
+├── main.rs              entry point
+├── app.rs               App: camera, tool, calibration, fetch. ~280 lines.
+├── scene.rs             Scene: graph, roads, pavements, drafts, per-scene interaction. ~600 lines.
+├── geo.rs               Web-Mercator math
+├── imagery.rs           tile sources + fetch
+├── spline.rs            cubic_bezier_point, offset_polyline, ear_clip
 ├── model/
-│ ├── mod.rs re-exports
-│ ├── tool.rs Tool (Pan / Calibrate / Road)
-│ ├── unit.rs Unit (Feet / Meters)
-│ ├── road.rs Road, CenterStyle
-│ └── graph.rs NodeId, NodeGraph
+│   ├── mod.rs           re-exports
+│   ├── tool.rs          Tool (Pan/Calibrate/Road/Pavement)
+│   ├── unit.rs          Unit (Feet/Meters)
+│   ├── road.rs          Road, CenterStyle
+│   ├── path.rs          PathAnchor, PathOwner, HandleRef, AnchorRef, HandleSide,
+│   │                    tessellate, recompute_auto_handles
+│   ├── pavement.rs      Pavement
+│   └── graph.rs         NodeId, NodeGraph
 └── ui/
-├── mod.rs
-├── toolbar.rs top toolbar (three rows) + status bar
-├── sidebar.rs right-side visual pickers
-├── paint.rs low-level drawing helpers
-└── canvas/
-├── mod.rs orchestration + Xform
-├── view.rs camera: fit, zoom, pan, WASD
-├── input.rs mouse + keyboard actions
-└── render.rs drawing the scene`
+    ├── mod.rs
+    ├── toolbar.rs       three toolbar rows + status bar
+    ├── sidebar.rs       right-side visual picker for center-line styles
+    ├── paint.rs         low-level draw helpers (no app state)
+    └── canvas/
+        ├── mod.rs       orchestration + Xform (image↔screen transform)
+        ├── view.rs      camera state, install_image, apply_camera, apply_wasd
+        ├── input.rs     mouse + keyboard handling
+        └── render.rs    drawing`
 
 ## Design notes
 
