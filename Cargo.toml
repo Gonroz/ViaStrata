@@ -1,0 +1,13 @@
+[package]
+name = "via_strata"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.29"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+rfd = "0.15"
+ureq = "2"
+
+[profile.dev]
+opt-level = 2
