@@ -68,7 +68,7 @@ panning is middle-drag or WASD only.
 
 ## Layout
 
-src/
+`src/
 ├── main.rs entry point, window setup
 ├── app.rs App state, high-level operations, update loop
 ├── geo.rs Web-Mercator math, "lat, lon" parsing
@@ -89,7 +89,7 @@ src/
 ├── mod.rs orchestration + Xform
 ├── view.rs camera: fit, zoom, pan, WASD
 ├── input.rs mouse + keyboard actions
-└── render.rs drawing the scene
+└── render.rs drawing the scene`
 
 ## Design notes
 
