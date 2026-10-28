@@ -6,16 +6,25 @@ use std::collections::{HashMap, HashSet};
 use eframe::egui::{Pos2, Vec2};
 
 use crate::model::{
-    default_two_way, recompute_auto_handles, AnchorRef, CenterStyle, EditMode, HandleRef,
-    HandleSide, Lane, Material, NodeGraph, NodeId, PathAnchor, PathOwner, Pavement, Road,
+    default_two_way, recompute_auto_handles, AnchorKind, AnchorRef, CenterStyle, EditMode,
+    HandleRef, HandleSide, Lane, LaneAnchor, Material, NodeGraph, NodeId, PathAnchor, PathOwner,
+    Pavement, Road, RoadEnd,
 };
 
-/// Identifies a specific road segment: the span between anchors
-/// `segment` and `segment + 1` of road `road`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SegmentRef {
     pub road: usize,
     pub segment: usize,
+}
+
+/// Result of snapping to a lane anchor during placement.
+#[derive(Clone, Copy, Debug)]
+pub struct LaneAnchorHit {
+    pub road: usize,
+    pub end: RoadEnd,
+    pub kind: AnchorKind,
+    pub position: Pos2,
+    pub outgoing_tangent: Vec2,
 }
 
 pub struct Scene {
@@ -116,13 +125,7 @@ impl Scene {
         }
     }
 
-    /// Finds the nearest node to `img_pt` within `radius` image pixels.
-    ///
-    /// `mode` filters which entity types are searched: Road mode sees only
-    /// road nodes, Sublayer mode sees only pavement nodes, and
-    /// Details/Decorations see nothing (those modes don't own node-bearing
-    /// entities yet). Without this filter, Sublayer nodes would be hoverable
-    /// and draggable while editing roads, and vice versa.
+    /// Finds the nearest node to `img_pt` within `radius`, filtered by mode.
     pub fn find_node(&self, mode: EditMode, img_pt: Pos2, radius: f32) -> Option<NodeId> {
         let (search_roads, search_pavements) = match mode {
             EditMode::Road => (true, false),
@@ -174,8 +177,7 @@ impl Scene {
         best.map(|(id, _)| id)
     }
 
-    /// Finds the nearest handle to `img_pt`, filtered by mode the same way
-    /// `find_node` is.
+    /// Finds the nearest handle to `img_pt`, filtered by mode.
     pub fn find_handle(&self, mode: EditMode, img_pt: Pos2, radius: f32) -> Option<HandleRef> {
         let (search_roads, search_pavements) = match mode {
             EditMode::Road => (true, false),
@@ -210,6 +212,79 @@ impl Scene {
             }
         }
         None
+    }
+
+    /// Finds the nearest lane anchor across all road endpoints within
+    /// `radius` image pixels. Filters out main anchors since those are
+    /// already covered by `find_node`.
+    ///
+    /// Only meaningful in Road mode. Returns `None` in other modes.
+    pub fn nearest_lane_anchor(
+        &self,
+        mode: EditMode,
+        img_pt: Pos2,
+        radius: f32,
+        px_per_m: f32,
+    ) -> Option<LaneAnchorHit> {
+        if mode != EditMode::Road {
+            return None;
+        }
+        if px_per_m <= 0.0 {
+            return None;
+        }
+
+        let r2 = radius * radius;
+        let mut best: Option<(LaneAnchorHit, f32)> = None;
+
+        for (ri, road) in self.roads.iter().enumerate() {
+            for end in [RoadEnd::Start, RoadEnd::End] {
+                for anchor in road.lane_anchors(end, &self.graph, px_per_m) {
+                    if matches!(anchor.kind, AnchorKind::Main) {
+                        continue;
+                    }
+                    let d2 = (anchor.position - img_pt).length_sq();
+                    if d2 <= r2 {
+                        match best {
+                            Some((_, bd2)) if bd2 <= d2 => {}
+                            _ => {
+                                best = Some((
+                                    LaneAnchorHit {
+                                        road: ri,
+                                        end,
+                                        kind: anchor.kind,
+                                        position: anchor.position,
+                                        outgoing_tangent: anchor.outgoing_tangent,
+                                    },
+                                    d2,
+                                ))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        best.map(|(h, _)| h)
+    }
+
+    /// All lane anchors for all road endpoints. Used by the renderer to
+    /// draw the anchor dots. Excludes main anchors, which are drawn by the
+    /// ordinary node renderer.
+    pub fn all_lane_anchors(&self, px_per_m: f32) -> Vec<LaneAnchor> {
+        let mut out = Vec::new();
+        if px_per_m <= 0.0 {
+            return out;
+        }
+        for road in &self.roads {
+            for end in [RoadEnd::Start, RoadEnd::End] {
+                for anchor in road.lane_anchors(end, &self.graph, px_per_m) {
+                    if matches!(anchor.kind, AnchorKind::Main) {
+                        continue;
+                    }
+                    out.push(anchor);
+                }
+            }
+        }
+        out
     }
 
     pub fn shared_nodes(&self) -> HashSet<NodeId> {
@@ -324,6 +399,7 @@ impl Scene {
 
         if let Some(a) = self.anchor_mut(href.anchor_ref()) {
             a.auto = false;
+            a.preferred_tangent = None;
             a.in_handle = new_in;
             a.out_handle = new_out;
         }
@@ -334,6 +410,7 @@ impl Scene {
             for a in &mut road.anchors {
                 if a.node == node {
                     a.auto = false;
+                    a.preferred_tangent = None;
                     a.out_handle += delta;
                     a.in_handle = -a.out_handle;
                 }
@@ -343,6 +420,7 @@ impl Scene {
             for a in &mut pa.anchors {
                 if a.node == node {
                     a.auto = false;
+                    a.preferred_tangent = None;
                     a.out_handle += delta;
                     a.in_handle = -a.out_handle;
                 }
@@ -499,6 +577,29 @@ impl Scene {
                 self.current_road.push(PathAnchor::new(id));
             }
         }
+        self.refresh_auto_handles();
+    }
+
+    /// Called when the user starts a new road by snapping to a lane anchor
+    /// on an existing road.
+    ///
+    /// Allocates a real node at the anchor's position and pushes an anchor
+    /// with a `preferred_tangent` set to the source's outgoing direction,
+    /// if `inherit` is true. When `inherit` is false (Shift held), the
+    /// anchor is positioned exactly at the lane anchor but the initial
+    /// direction is determined by the next click, like any free-placed
+    /// first anchor.
+    ///
+    /// The source road is *not* modified. This is a snapshot connection,
+    /// not a live bond.
+    pub fn road_anchor_click(&mut self, hit: LaneAnchorHit, inherit: bool) {
+        self.deselect_segment();
+        let id = self.add_node(hit.position);
+        let mut anchor = PathAnchor::new(id);
+        if inherit {
+            anchor = anchor.with_preferred_tangent(hit.outgoing_tangent);
+        }
+        self.current_road.push(anchor);
         self.refresh_auto_handles();
     }
 

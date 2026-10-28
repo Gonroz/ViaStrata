@@ -14,7 +14,7 @@ const SECONDARY_CLICK_MAX_MOVE_PX: f32 = 8.0;
 pub fn handle(app: &mut App, resp: &egui::Response, x: &Xform, ctx: &egui::Context) {
     handle_hover(app, resp, x);
     handle_drag(app, resp, x, ctx);
-    handle_primary_click(app, resp, x);
+    handle_primary_click(app, resp, x, ctx);
     handle_secondary_click(app, resp, x, ctx);
     handle_calibration_click(app, resp, x);
     handle_delete_key(app, ctx);
@@ -52,9 +52,6 @@ fn handle_hover(app: &mut App, resp: &egui::Response, x: &Xform) {
     let handle_r = x.screen_dist_to_image(HANDLE_HIT_RADIUS_PX);
     let node_r = x.screen_dist_to_image(NODE_HIT_RADIUS_PX);
 
-    // Both lookups are mode-filtered: Road mode finds only road entities,
-    // Sublayer mode finds only pavement entities, and Details/Decorations
-    // find nothing (which is fine — those modes don't have editable nodes).
     app.scene.hover_handle = app.scene.find_handle(app.mode, img, handle_r);
     app.scene.hover_node = if app.scene.hover_handle.is_some() {
         None
@@ -101,7 +98,20 @@ fn handle_drag(app: &mut App, resp: &egui::Response, x: &Xform, ctx: &egui::Cont
     }
 }
 
-fn handle_primary_click(app: &mut App, resp: &egui::Response, x: &Xform) {
+/// Primary click with a path tool.
+///
+/// Road tool priority, high to low:
+///
+/// 1. Mid-draft → place the next point (node snap only, existing behavior).
+/// 2. Empty draft, on a lane anchor → start a new road there, inheriting
+///    the source's direction (Shift held = place at the anchor position
+///    but don't inherit).
+/// 3. Empty draft, on a node → start a new road there (existing behavior).
+/// 4. Empty draft, on a road body → select that segment.
+/// 5. Empty draft, on empty canvas → start a new road freely.
+///
+/// Pavement tool is unchanged: node snap or free placement.
+fn handle_primary_click(app: &mut App, resp: &egui::Response, x: &Xform, ctx: &egui::Context) {
     if !is_path_tool(app.tool) {
         return;
     }
@@ -124,16 +134,18 @@ fn handle_primary_click(app: &mut App, resp: &egui::Response, x: &Xform) {
         app.status = "Set the scale first (fetch satellite or calibrate).".into();
         return;
     }
-    let snap = app.scene.find_node(
-        app.mode,
-        img,
-        x.screen_dist_to_image(NODE_HIT_RADIUS_PX),
-    );
+    let ppm = app.px_per_m.unwrap();
+    let node_r = x.screen_dist_to_image(NODE_HIT_RADIUS_PX);
+    let snap = app.scene.find_node(app.mode, img, node_r);
 
     match (app.mode, app.tool) {
         (EditMode::Road, Tool::Road) => {
             if !app.scene.current_road.is_empty() {
+                // Mid-drawing: existing behavior, node snap only.
                 app.scene.road_click(img, snap);
+            } else if let Some(hit) = app.scene.nearest_lane_anchor(app.mode, img, node_r, ppm) {
+                let inherit = !ctx.input(|i| i.modifiers.shift);
+                app.scene.road_anchor_click(hit, inherit);
             } else if snap.is_some() {
                 app.scene.deselect_segment();
                 app.scene.road_click(img, snap);

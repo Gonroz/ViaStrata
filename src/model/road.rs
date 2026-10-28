@@ -1,31 +1,21 @@
 //! Roads, their cross-sections, and per-segment overrides.
-//!
-//! A road's default cross-section (lanes + center style) applies to every
-//! segment it's made of. Individual segments can override that — a
-//! segment might have a bike lane, a turn pocket, or an extra lane that
-//! its neighbours don't. Overrides are keyed by segment index, which runs
-//! `0..anchors.len()-1`.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 
+use eframe::egui::Pos2;
+
+use super::anchor::{AnchorKind, LaneAnchor, RoadEnd};
+use super::graph::NodeGraph;
 use super::lane::{total_width_m, Lane};
 use super::path::PathAnchor;
 
 /// How the center of a two-way road is marked.
-///
-/// Applied at every boundary in a segment's cross-section where adjacent
-/// travel lanes face opposite directions. For the common "one row forward,
-/// one row backward" layout, that's exactly one boundary.
 #[derive(PartialEq, Clone, Copy, Debug)]
 pub enum CenterStyle {
-    /// No center marking.
     None,
-    /// Single solid yellow — passing not permitted in either direction.
     YellowSolid,
-    /// Two parallel solid yellow lines.
     YellowDouble,
-    /// Dashed yellow — passing permitted where sight distance allows.
     YellowDashed,
 }
 
@@ -41,9 +31,6 @@ impl CenterStyle {
 }
 
 /// A cross-section: the ordered lane list plus the center-line style.
-///
-/// This is the unit of style that a road carries by default and that an
-/// individual segment can override.
 #[derive(Clone, PartialEq)]
 pub struct SegmentStyle {
     pub lanes: Vec<Lane>,
@@ -58,29 +45,18 @@ impl SegmentStyle {
 
 /// A road is a sequence of path anchors plus a cross-section, plus any
 /// per-segment overrides.
-///
-/// Width is derived from lane widths scaled by `px_per_m × zoom`. Segments
-/// whose neighbouring segments have different widths taper between them —
-/// see `anchor_widths_m` for the exact rule.
 pub struct Road {
     pub anchors: Vec<PathAnchor>,
-    /// The default cross-section. Applied to every segment that doesn't
-    /// have an override.
     pub lanes: Vec<Lane>,
     pub center: CenterStyle,
-    /// Per-segment overrides, keyed by segment index.
     pub segment_overrides: HashMap<usize, SegmentStyle>,
 }
 
 impl Road {
-    /// Number of segments (spans between adjacent anchors).
     pub fn num_segments(&self) -> usize {
         self.anchors.len().saturating_sub(1)
     }
 
-    /// The effective cross-section for segment `i`. Borrows the override
-    /// when one exists, otherwise synthesizes the default. `Cow` avoids
-    /// cloning the default on every access.
     pub fn style_for_segment(&self, i: usize) -> Cow<'_, SegmentStyle> {
         match self.segment_overrides.get(&i) {
             Some(s) => Cow::Borrowed(s),
@@ -95,9 +71,6 @@ impl Road {
         self.style_for_segment(i).total_width_m()
     }
 
-    /// Ensures segment `i` has an override and returns it mutably. On first
-    /// call the override is initialized from the current effective style,
-    /// so nothing visibly changes until the caller writes to it.
     pub fn segment_override_mut(&mut self, i: usize) -> &mut SegmentStyle {
         if !self.segment_overrides.contains_key(&i) {
             let style = self.style_for_segment(i).into_owned();
@@ -106,14 +79,10 @@ impl Road {
         self.segment_overrides.get_mut(&i).unwrap()
     }
 
-    /// Removes any override for segment `i`, so it falls back to the road
-    /// default.
     pub fn reset_segment(&mut self, i: usize) {
         self.segment_overrides.remove(&i);
     }
 
-    /// Whether segment `i`'s override (if any) is currently identical to
-    /// the road default. Used to clean up no-op overrides on deselect.
     pub fn segment_equals_default(&self, i: usize) -> bool {
         match self.segment_overrides.get(&i) {
             Some(over) => over.lanes == self.lanes && over.center == self.center,
@@ -121,17 +90,6 @@ impl Road {
         }
     }
 
-    /// Width at each anchor, in meters.
-    ///
-    /// * For the first and last anchors: the single adjacent segment's width.
-    /// * For interior anchors: the **max** of the two adjacent segments'
-    ///   widths.
-    ///
-    /// The max rule means a width transition happens in the *narrower* of
-    /// the two segments, which matches how real roads behave — a road that
-    /// gains a lane widens before the new paint appears, then stays wide.
-    /// The alternative (using the narrower width) would compress the wider
-    /// segment, which reads as a bug.
     pub fn anchor_widths_m(&self) -> Vec<f32> {
         let n = self.anchors.len();
         if n == 0 {
@@ -151,5 +109,139 @@ impl Road {
             };
         }
         out
+    }
+
+    /// Computes the lane anchors at `end`.
+    ///
+    /// The main anchor (at the road centerline) is included so callers can
+    /// draw all anchors in a uniform list; the caller usually filters it out
+    /// since it's already shown as an ordinary node.
+    ///
+    /// `px_per_m` converts lane widths from meters into image pixels. All
+    /// returned positions and tangents are in image space. Returns an empty
+    /// list if the road has fewer than 2 anchors or the endpoint is
+    /// degenerate (zero-length forward tangent).
+    pub fn lane_anchors(
+        &self,
+        end: RoadEnd,
+        graph: &NodeGraph,
+        px_per_m: f32,
+    ) -> Vec<LaneAnchor> {
+        if self.anchors.len() < 2 || px_per_m <= 0.0 {
+            return Vec::new();
+        }
+
+        let (endpoint_anchor, adjacent_anchor, seg_idx) = match end {
+            RoadEnd::Start => {
+                let a = &self.anchors[0];
+                let b = &self.anchors[1];
+                (a, b, 0usize)
+            }
+            RoadEnd::End => {
+                let n = self.anchors.len();
+                let a = &self.anchors[n - 1];
+                let b = &self.anchors[n - 2];
+                (a, b, n - 2)
+            }
+        };
+
+        let Some(p_end) = graph.pos(endpoint_anchor.node) else {
+            return Vec::new();
+        };
+        let Some(p_adj) = graph.pos(adjacent_anchor.node) else {
+            return Vec::new();
+        };
+
+        // Forward tangent: the direction the road travels as it leaves
+        // (at Start) or as it arrives (at End).
+        let forward = match end {
+            RoadEnd::Start => {
+                if endpoint_anchor.out_handle.length_sq() > 1e-6 {
+                    endpoint_anchor.out_handle.normalized()
+                } else {
+                    let d = p_adj - p_end;
+                    if d.length_sq() < 1e-9 {
+                        return Vec::new();
+                    }
+                    d.normalized()
+                }
+            }
+            RoadEnd::End => {
+                if endpoint_anchor.in_handle.length_sq() > 1e-6 {
+                    (-endpoint_anchor.in_handle).normalized()
+                } else {
+                    let d = p_end - p_adj;
+                    if d.length_sq() < 1e-9 {
+                        return Vec::new();
+                    }
+                    d.normalized()
+                }
+            }
+        };
+
+        // Outgoing tangent: a new road attached here travels away from the
+        // source, not back along it. At Start that's reversed; at End it's
+        // the same as forward.
+        let outgoing = match end {
+            RoadEnd::Start => -forward,
+            RoadEnd::End => forward,
+        };
+
+        let style = self.style_for_segment(seg_idx);
+        let total_m = style.total_width_m();
+        if total_m <= 0.0 {
+            return Vec::new();
+        }
+
+        // Perpendicular in image-y-down space: rotate forward 90° clockwise.
+        let perp = eframe::egui::Vec2::new(-forward.y, forward.x);
+
+        let mut anchors = Vec::with_capacity(style.lanes.len() * 2 + 1);
+
+        // Main anchor.
+        anchors.push(LaneAnchor {
+            position: p_end,
+            kind: AnchorKind::Main,
+            outgoing_tangent: outgoing,
+        });
+
+        // Boundaries and lane centers, walking left to right.
+        let mut cursor_m = -total_m / 2.0;
+        for (i, lane) in style.lanes.iter().enumerate() {
+            let boundary_pos = p_end + perp * (cursor_m * px_per_m);
+            anchors.push(LaneAnchor {
+                position: boundary_pos,
+                kind: AnchorKind::Boundary(i),
+                outgoing_tangent: outgoing,
+            });
+
+            let center_m = cursor_m + lane.width_m / 2.0;
+            let center_pos = p_end + perp * (center_m * px_per_m);
+            anchors.push(LaneAnchor {
+                position: center_pos,
+                kind: AnchorKind::LaneCenter(i),
+                outgoing_tangent: outgoing,
+            });
+
+            cursor_m += lane.width_m;
+        }
+        // Final boundary (right edge).
+        let final_pos = p_end + perp * (cursor_m * px_per_m);
+        anchors.push(LaneAnchor {
+            position: final_pos,
+            kind: AnchorKind::Boundary(style.lanes.len()),
+            outgoing_tangent: outgoing,
+        });
+
+        anchors
+    }
+
+    /// The endpoint position of `end`, if the road has one.
+    pub fn endpoint_position(&self, end: RoadEnd, graph: &NodeGraph) -> Option<Pos2> {
+        let anchor = match end {
+            RoadEnd::Start => self.anchors.first()?,
+            RoadEnd::End => self.anchors.last()?,
+        };
+        graph.pos(anchor.node)
     }
 }

@@ -2,13 +2,14 @@
 
 use std::collections::HashSet;
 
-use eframe::egui::{self, pos2, Color32, Pos2, Rect, Stroke};
+use eframe::egui::{self, pos2, Color32, Pos2, Rect, Stroke, Vec2};
 
 use super::input::NODE_HIT_RADIUS_PX;
 use super::Xform;
 use crate::app::App;
 use crate::model::{
-    tessellate, AnchorRef, EditMode, HandleRef, HandleSide, NodeId, PathAnchor, PathOwner, Tool,
+    recompute_auto_handles, tessellate, AnchorKind, AnchorRef, EditMode, HandleRef, HandleSide,
+    NodeGraph, NodeId, PathAnchor, PathOwner, Tool,
 };
 use crate::spline;
 use crate::ui::paint::{
@@ -105,31 +106,41 @@ pub fn draw(
 
     // --- Draft road ----------------------------------------------------
     if app.mode == EditMode::Road && !app.scene.current_road.is_empty() {
-        let anchors = app.scene.current_road.clone();
-        let polyline_img = tessellate(&anchors, &app.scene.graph, false, SAMPLES_PER_SEGMENT);
-        let mut screen: Vec<Pos2> = polyline_img.iter().map(|&p| x.to_screen(p)).collect();
-        if let Some(h) = resp.hover_pos() {
+        let hover_img = resp.hover_pos().map(|h| {
             let img = x.to_image(h);
-            let preview = app
-                .scene
+            app.scene
                 .find_node(
                     app.mode,
                     img,
                     x.screen_dist_to_image(NODE_HIT_RADIUS_PX),
                 )
                 .and_then(|id| app.scene.graph.pos(id))
-                .unwrap_or(img);
-            screen.push(x.to_screen(preview));
+                .unwrap_or(img)
+        });
+        let screen_polyline =
+            draft_preview_polyline(app, x, hover_img, ppm);
+        if screen_polyline.len() >= 2 {
+            let w = crate::model::total_width_m(&app.scene.draft_lanes) * ppm * x.zoom();
+            let widths = vec![w; screen_polyline.len()];
+            let style = crate::model::SegmentStyle {
+                lanes: app.scene.draft_lanes.clone(),
+                center: app.scene.center_style,
+            };
+            paint_road_body(painter, &screen_polyline, &widths);
+            paint_lane_tints_tapered(painter, &screen_polyline, &widths, &style);
+            paint_road_markings_tapered(painter, &screen_polyline, &widths, &style);
         }
-        let w = crate::model::total_width_m(&app.scene.draft_lanes) * ppm * x.zoom();
-        let widths = vec![w; screen.len()];
-        let style = crate::model::SegmentStyle {
-            lanes: app.scene.draft_lanes.clone(),
-            center: app.scene.center_style,
-        };
-        paint_road_body(painter, &screen, &widths);
-        paint_lane_tints_tapered(painter, &screen, &widths, &style);
-        paint_road_markings_tapered(painter, &screen, &widths, &style);
+    }
+
+    // --- Lane anchors --------------------------------------------------
+    //
+    // Shown whenever the Road tool is active with an empty draft. These
+    // are the snap targets for starting a new road on a lane.
+    if app.mode == EditMode::Road
+        && app.tool == Tool::Road
+        && app.scene.current_road.is_empty()
+    {
+        paint_lane_anchor_dots(app, painter, resp, x, rect, ppm);
     }
 
     // --- Node handles + direction handles -----------------------------
@@ -151,6 +162,119 @@ pub fn draw(
 
     if !app.attribution.is_empty() {
         paint_attribution(painter, rect, &app.attribution);
+    }
+}
+
+/// Builds the preview polyline for the current road draft, including an
+/// optional hover point as a virtual last anchor.
+///
+/// Uses a temporary graph so the normal `recompute_auto_handles` and
+/// `tessellate` pipelines can be reused without special-casing. This means
+/// the preview reflects the effect of any `preferred_tangent` on the first
+/// anchor — the curve visibly inherits the source road's direction.
+fn draft_preview_polyline(
+    app: &App,
+    x: &Xform,
+    hover_img: Option<Pos2>,
+    _ppm: f32,
+) -> Vec<Pos2> {
+    // Snapshot the draft anchors and their positions.
+    let mut anchors = app.scene.current_road.clone();
+    let mut positions: Vec<Pos2> = anchors
+        .iter()
+        .filter_map(|a| app.scene.graph.pos(a.node))
+        .collect();
+
+    // If a hover point is present, treat it as a virtual last anchor.
+    if let Some(h) = hover_img {
+        if !anchors.is_empty() {
+            positions.push(h);
+            anchors.push(PathAnchor::new(NodeId(u32::MAX)));
+        }
+    }
+
+    if anchors.len() < 2 {
+        return Vec::new();
+    }
+
+    // Build a temporary graph from the positions we have, then run the
+    // normal auto-handle computation and tessellation on it. Cheap, and
+    // keeps the preview logic faithful to the real pipeline.
+    let mut temp_graph = NodeGraph::new();
+    let mut temp_anchors: Vec<PathAnchor> = anchors;
+    for (i, a) in temp_anchors.iter_mut().enumerate() {
+        a.node = temp_graph.add(positions[i]);
+    }
+
+    recompute_auto_handles(&mut temp_anchors, &temp_graph, false);
+    let img_polyline = tessellate(&temp_anchors, &temp_graph, false, SAMPLES_PER_SEGMENT);
+    img_polyline.iter().map(|&p| x.to_screen(p)).collect()
+}
+
+/// Draws lane anchors at every road endpoint when the user is starting a
+/// new road. The nearest one to the cursor is highlighted.
+fn paint_lane_anchor_dots(
+    app: &App,
+    painter: &egui::Painter,
+    resp: &egui::Response,
+    x: &Xform,
+    rect: Rect,
+    px_per_m: f32,
+) {
+    if px_per_m <= 0.0 {
+        return;
+    }
+
+    // Precompute which anchor is closest to the cursor within snap radius,
+    // so we can highlight it.
+    let cursor_img = resp.hover_pos().map(|h| x.to_image(h));
+    let snap_r = x.screen_dist_to_image(NODE_HIT_RADIUS_PX);
+    let hovered = cursor_img
+        .and_then(|c| app.scene.nearest_lane_anchor(app.mode, c, snap_r, px_per_m));
+
+    for road in &app.scene.roads {
+        for end in [crate::model::RoadEnd::Start, crate::model::RoadEnd::End] {
+            for anchor in road.lane_anchors(end, &app.scene.graph, px_per_m) {
+                if matches!(anchor.kind, AnchorKind::Main) {
+                    continue;
+                }
+                let screen_pos = x.to_screen(anchor.position);
+                if !rect.contains(screen_pos) {
+                    continue;
+                }
+
+                let is_hovered = hovered
+                    .map(|h| {
+                        h.position.distance(anchor.position) < 0.5
+                    })
+                    .unwrap_or(false);
+
+                let (r, color) = match anchor.kind {
+                    AnchorKind::Main => continue,
+                    AnchorKind::LaneCenter(_) => {
+                        if is_hovered {
+                            (4.5, Color32::from_rgb(255, 220, 90))
+                        } else {
+                            (3.0, Color32::from_rgb(90, 200, 255))
+                        }
+                    }
+                    AnchorKind::Boundary(_) => {
+                        if is_hovered {
+                            (3.5, Color32::from_rgb(255, 220, 90))
+                        } else {
+                            (2.0, Color32::from_rgb(170, 170, 170))
+                        }
+                    }
+                };
+
+                painter.circle_filled(screen_pos, r, color);
+                painter.circle_stroke(
+                    screen_pos,
+                    r,
+                    Stroke::new(1.0_f32, Color32::from_black_alpha(140)),
+                );
+            }
+        }
     }
 }
 
@@ -250,9 +374,6 @@ fn paint_road_whole_markings(
 }
 
 fn paint_handles(app: &App, painter: &egui::Painter, x: &Xform, shared: &HashSet<NodeId>) {
-    // Only paint handles for entities belonging to the current mode.
-    // Details and Decorations don't own node-bearing entities, so nothing
-    // is painted there.
     let show_roads = app.mode == EditMode::Road;
     let show_pavements = app.mode == EditMode::Sublayer;
     if !show_roads && !show_pavements {
@@ -271,10 +392,6 @@ fn paint_handles(app: &App, painter: &egui::Painter, x: &Xform, shared: &HashSet
         .map(|h| h.anchor_ref())
         .or_else(|| app.scene.hover_handle.map(|h| h.anchor_ref()));
 
-    // Direction handles. Only show if the anchor belongs to an entity in
-    // the current mode; a shared node between a road and a pavement
-    // should show road handles in Road mode and pavement handles in
-    // Sublayer mode, not both at once.
     let hover_anchor_owner: Option<(PathOwner, usize)> = app
         .scene
         .hover_node
@@ -307,7 +424,6 @@ fn paint_handles(app: &App, painter: &egui::Painter, x: &Xform, shared: &HashSet
         }
     }
 
-    // Node dots, filtered by mode.
     let mut seen: HashSet<NodeId> = HashSet::new();
     let mut paint_one = |id: NodeId| {
         if !seen.insert(id) {
@@ -358,7 +474,7 @@ fn draw_direction_handles(
     owner: PathOwner,
     anchor_index: usize,
 ) {
-    let draw_one = |offset: eframe::egui::Vec2, side: HandleSide| {
+    let draw_one = |offset: Vec2, side: HandleSide| {
         if offset.length_sq() < 1e-6 {
             return;
         }
@@ -385,11 +501,6 @@ fn draw_direction_handles(
     draw_one(anchor.out_handle, HandleSide::Out);
 }
 
-/// Returns the (owner, index) of an anchor referencing `id`, preferring
-/// entities from the current mode. A shared node between a road and a
-/// pavement resolves to the road when in Road mode and to the pavement
-/// when in Sublayer mode, so direction handles appear on the entity the
-/// user is actually editing.
 fn anchor_owner_for_node(app: &App, id: NodeId) -> Option<(PathOwner, usize)> {
     match app.mode {
         EditMode::Road => {

@@ -1,6 +1,7 @@
 //! Domain types. Everything that describes *what a scene is*, with no
 //! dependency on egui widgets or the render pipeline.
 
+mod anchor;
 mod edit_mode;
 mod graph;
 mod lane;
@@ -11,6 +12,7 @@ mod road;
 mod tool;
 mod unit;
 
+pub use anchor::{AnchorKind, LaneAnchor, RoadEnd};
 pub use edit_mode::EditMode;
 pub use graph::{NodeGraph, NodeId};
 pub use lane::{default_two_way, display_unit_to_meters, total_width_m, width_in_display_unit};
