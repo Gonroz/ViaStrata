@@ -43,24 +43,21 @@ pub fn draw(
     let ppm = app.px_per_m.unwrap_or(1.0);
     let shared = app.scene.shared_nodes();
 
-    // --- Pavements (under everything) ---------------------------------
+    // Pavements render regardless of mode — the design is always visible.
     for pa in &app.scene.pavements {
         let polyline_img = tessellate(&pa.anchors, &app.scene.graph, true, SAMPLES_PER_SEGMENT);
         let polyline: Vec<Pos2> = polyline_img.iter().map(|&p| x.to_screen(p)).collect();
         paint_pavement(painter, &polyline, pa.material.color());
     }
 
-    // --- Road bodies (pass 1) -----------------------------------------
     for road in &app.scene.roads {
         paint_road_whole_body(app, painter, x, road, ppm, &shared);
     }
 
-    // --- Tints + markings (pass 2) ------------------------------------
     for road in &app.scene.roads {
         paint_road_whole_markings(app, painter, x, road, ppm);
     }
 
-    // --- Selection highlight ------------------------------------------
     if let Some(seg) = app.scene.selected_segment {
         if let Some(road) = app.scene.roads.get(seg.road) {
             if seg.segment < road.num_segments() {
@@ -72,10 +69,6 @@ pub fn draw(
     }
 
     // --- Draft pavement ------------------------------------------------
-    //
-    // Only drawn in Sublayer mode, since the Pavement tool isn't available
-    // anywhere else. The draft is filled with the current material color
-    // (at reduced alpha) so the user can see what they're about to commit.
     if app.mode == EditMode::Sublayer && !app.scene.current_pavement.is_empty() {
         let anchors = app.scene.current_pavement.clone();
         let polyline_img = tessellate(&anchors, &app.scene.graph, false, SAMPLES_PER_SEGMENT);
@@ -84,7 +77,11 @@ pub fn draw(
             let img = x.to_image(h);
             let preview = app
                 .scene
-                .find_node(img, x.screen_dist_to_image(NODE_HIT_RADIUS_PX))
+                .find_node(
+                    app.mode,
+                    img,
+                    x.screen_dist_to_image(NODE_HIT_RADIUS_PX),
+                )
                 .and_then(|id| app.scene.graph.pos(id))
                 .unwrap_or(img);
             screen.push(x.to_screen(preview));
@@ -97,12 +94,9 @@ pub fn draw(
                 screen.push(x.to_screen(first));
             }
         }
-        // Fill at reduced opacity so the user sees the material color
-        // without it feeling committed.
         if screen.len() >= 3 {
             paint_pavement(painter, &screen, app.scene.draft_material.preview_color());
         }
-        // Blue outline on top so the in-progress state is obvious.
         painter.add(egui::Shape::line(
             screen,
             Stroke::new(2.0_f32, Color32::from_rgb(120, 170, 230)),
@@ -118,7 +112,11 @@ pub fn draw(
             let img = x.to_image(h);
             let preview = app
                 .scene
-                .find_node(img, x.screen_dist_to_image(NODE_HIT_RADIUS_PX))
+                .find_node(
+                    app.mode,
+                    img,
+                    x.screen_dist_to_image(NODE_HIT_RADIUS_PX),
+                )
                 .and_then(|id| app.scene.graph.pos(id))
                 .unwrap_or(img);
             screen.push(x.to_screen(preview));
@@ -252,6 +250,15 @@ fn paint_road_whole_markings(
 }
 
 fn paint_handles(app: &App, painter: &egui::Painter, x: &Xform, shared: &HashSet<NodeId>) {
+    // Only paint handles for entities belonging to the current mode.
+    // Details and Decorations don't own node-bearing entities, so nothing
+    // is painted there.
+    let show_roads = app.mode == EditMode::Road;
+    let show_pavements = app.mode == EditMode::Sublayer;
+    if !show_roads && !show_pavements {
+        return;
+    }
+
     let base = Color32::from_rgb(220, 220, 220);
     let hover = Color32::from_rgb(255, 210, 80);
     let outline = Color32::from_black_alpha(160);
@@ -264,6 +271,10 @@ fn paint_handles(app: &App, painter: &egui::Painter, x: &Xform, shared: &HashSet
         .map(|h| h.anchor_ref())
         .or_else(|| app.scene.hover_handle.map(|h| h.anchor_ref()));
 
+    // Direction handles. Only show if the anchor belongs to an entity in
+    // the current mode; a shared node between a road and a pavement
+    // should show road handles in Road mode and pavement handles in
+    // Sublayer mode, not both at once.
     let hover_anchor_owner: Option<(PathOwner, usize)> = app
         .scene
         .hover_node
@@ -271,25 +282,32 @@ fn paint_handles(app: &App, painter: &egui::Painter, x: &Xform, shared: &HashSet
         .or_else(|| active_anchor.map(|r| (r.owner, r.index)));
 
     if let Some((owner, idx)) = hover_anchor_owner {
-        let href = AnchorRef { owner, index: idx };
-        if let Some(anchor) = app.scene.anchor(href) {
-            if let Some(pos) = app.scene.anchor_position(href) {
-                let s = x.to_screen(pos);
-                draw_direction_handles(
-                    painter,
-                    x,
-                    anchor,
-                    s,
-                    handle_line,
-                    handle_dot,
-                    app.scene.hover_handle,
-                    owner,
-                    idx,
-                );
+        let owner_visible = match owner {
+            PathOwner::Road(_) => show_roads,
+            PathOwner::Pavement(_) => show_pavements,
+        };
+        if owner_visible {
+            let href = AnchorRef { owner, index: idx };
+            if let Some(anchor) = app.scene.anchor(href) {
+                if let Some(pos) = app.scene.anchor_position(href) {
+                    let s = x.to_screen(pos);
+                    draw_direction_handles(
+                        painter,
+                        x,
+                        anchor,
+                        s,
+                        handle_line,
+                        handle_dot,
+                        app.scene.hover_handle,
+                        owner,
+                        idx,
+                    );
+                }
             }
         }
     }
 
+    // Node dots, filtered by mode.
     let mut seen: HashSet<NodeId> = HashSet::new();
     let mut paint_one = |id: NodeId| {
         if !seen.insert(id) {
@@ -306,20 +324,24 @@ fn paint_handles(app: &App, painter: &egui::Painter, x: &Xform, shared: &HashSet
         painter.circle_stroke(s, HANDLE_RADIUS, Stroke::new(1.0_f32, outline));
     };
 
-    for a in &app.scene.current_road {
-        paint_one(a.node);
-    }
-    for a in &app.scene.current_pavement {
-        paint_one(a.node);
-    }
-    for road in &app.scene.roads {
-        for a in &road.anchors {
+    if show_roads {
+        for a in &app.scene.current_road {
             paint_one(a.node);
         }
+        for road in &app.scene.roads {
+            for a in &road.anchors {
+                paint_one(a.node);
+            }
+        }
     }
-    for pa in &app.scene.pavements {
-        for a in &pa.anchors {
+    if show_pavements {
+        for a in &app.scene.current_pavement {
             paint_one(a.node);
+        }
+        for pa in &app.scene.pavements {
+            for a in &pa.anchors {
+                paint_one(a.node);
+            }
         }
     }
 }
@@ -363,20 +385,33 @@ fn draw_direction_handles(
     draw_one(anchor.out_handle, HandleSide::Out);
 }
 
+/// Returns the (owner, index) of an anchor referencing `id`, preferring
+/// entities from the current mode. A shared node between a road and a
+/// pavement resolves to the road when in Road mode and to the pavement
+/// when in Sublayer mode, so direction handles appear on the entity the
+/// user is actually editing.
 fn anchor_owner_for_node(app: &App, id: NodeId) -> Option<(PathOwner, usize)> {
-    for (i, road) in app.scene.roads.iter().enumerate() {
-        for (ai, a) in road.anchors.iter().enumerate() {
-            if a.node == id {
-                return Some((PathOwner::Road(i), ai));
+    match app.mode {
+        EditMode::Road => {
+            for (i, road) in app.scene.roads.iter().enumerate() {
+                for (ai, a) in road.anchors.iter().enumerate() {
+                    if a.node == id {
+                        return Some((PathOwner::Road(i), ai));
+                    }
+                }
             }
+            None
         }
-    }
-    for (i, pa) in app.scene.pavements.iter().enumerate() {
-        for (ai, a) in pa.anchors.iter().enumerate() {
-            if a.node == id {
-                return Some((PathOwner::Pavement(i), ai));
+        EditMode::Sublayer => {
+            for (i, pa) in app.scene.pavements.iter().enumerate() {
+                for (ai, a) in pa.anchors.iter().enumerate() {
+                    if a.node == id {
+                        return Some((PathOwner::Pavement(i), ai));
+                    }
+                }
             }
+            None
         }
+        EditMode::Details | EditMode::Decorations => None,
     }
-    None
 }

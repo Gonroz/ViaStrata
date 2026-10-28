@@ -17,6 +17,15 @@ use crate::model::{
 use crate::scene::SegmentRef;
 use crate::ui::paint::{paint_cross_section, paint_road_preview};
 
+/// Fixed width of the side panel, in logical pixels.
+///
+/// The panel is pinned to this width via `width_range(FIXED_WIDTH..=FIXED_WIDTH)`
+/// so it never changes size across mode switches. Without that pinning,
+/// egui auto-shrinks the panel to fit its content, and modes with less
+/// content (Details, Decorations) would progressively shrink it every
+/// time you toggled into them.
+const FIXED_WIDTH: f32 = 300.0;
+
 const CENTER_STYLES: &[CenterStyle] = &[
     CenterStyle::None,
     CenterStyle::YellowSolid,
@@ -32,7 +41,7 @@ const CROSS_SECTION_HEIGHT: f32 = 56.0;
 pub fn show(app: &mut App, ctx: &egui::Context) {
     egui::SidePanel::right("side_menu")
         .resizable(false)
-        .default_width(300.0)
+        .width_range(FIXED_WIDTH..=FIXED_WIDTH)
         .show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| match app.mode {
                 EditMode::Sublayer => sublayer_sidebar(app, ui),
@@ -91,7 +100,6 @@ fn material_item(app: &mut App, ui: &mut egui::Ui, mat: Material) {
     };
     ui.painter().rect(rect, 4.0, bg, border);
 
-    // Color swatch on the left.
     let swatch_size = 32.0;
     let swatch_rect = Rect::from_min_size(
         Pos2::new(rect.left() + ITEM_PAD + 2.0, rect.center().y - swatch_size / 2.0),
@@ -99,7 +107,6 @@ fn material_item(app: &mut App, ui: &mut egui::Ui, mat: Material) {
     );
     ui.painter().rect(swatch_rect, 3.0, mat.color(), Stroke::NONE);
 
-    // Label to the right of the swatch.
     ui.painter().text(
         Pos2::new(swatch_rect.right() + 10.0, rect.center().y),
         Align2::LEFT_CENTER,

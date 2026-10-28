@@ -20,7 +20,6 @@ pub fn show_status(app: &App, ctx: &egui::Context) {
     });
 }
 
-/// Row 1: file, mode selector, tool selector, units, scale.
 fn image_row(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         if ui.button("Open image…").clicked() {
@@ -28,8 +27,6 @@ fn image_row(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
         }
         ui.separator();
 
-        // Mode selector. Selected mode is highlighted; clicking a different
-        // one calls `set_mode`, which may reset the tool.
         for mode in EditMode::all() {
             let is_current = app.mode == *mode;
             if ui.selectable_label(is_current, mode.label()).clicked() && !is_current {
@@ -38,7 +35,6 @@ fn image_row(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
         }
         ui.separator();
 
-        // Tool selector, filtered by mode.
         for &tool in app.mode.tools() {
             let label = app.mode.tool_label(tool);
             ui.selectable_value(&mut app.tool, tool, label);
@@ -62,7 +58,6 @@ fn image_row(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
     });
 }
 
-/// Row 2: coordinates + satellite source settings.
 fn location_row(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.label("Location:");
@@ -104,7 +99,6 @@ fn location_row(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
     });
 }
 
-/// Row 3: controls for the active tool.
 fn tool_row(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal(|ui| match app.tool {
         Tool::Calibrate => {
@@ -125,7 +119,7 @@ fn tool_row(app: &mut App, ui: &mut egui::Ui) {
                 let meters = app.calib_dist * app.unit.to_m();
                 if px > 0.0 && meters > 0.0 {
                     app.px_per_m = Some(px / meters);
-                    app.tool = Tool::Road;
+                    app.tool = app.mode.default_tool();
                     app.status =
                         "Click to add road points. Double-click or Enter to finish.".into();
                 }

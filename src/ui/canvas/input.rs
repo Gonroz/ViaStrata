@@ -4,7 +4,7 @@ use eframe::egui::{self, PointerButton, Vec2};
 
 use super::Xform;
 use crate::app::App;
-use crate::model::{PathAnchor, Tool};
+use crate::model::{EditMode, PathAnchor, Tool};
 
 pub(crate) const NODE_HIT_RADIUS_PX: f32 = 10.0;
 const HANDLE_HIT_RADIUS_PX: f32 = 8.0;
@@ -52,11 +52,14 @@ fn handle_hover(app: &mut App, resp: &egui::Response, x: &Xform) {
     let handle_r = x.screen_dist_to_image(HANDLE_HIT_RADIUS_PX);
     let node_r = x.screen_dist_to_image(NODE_HIT_RADIUS_PX);
 
-    app.scene.hover_handle = app.scene.find_handle(img, handle_r);
+    // Both lookups are mode-filtered: Road mode finds only road entities,
+    // Sublayer mode finds only pavement entities, and Details/Decorations
+    // find nothing (which is fine — those modes don't have editable nodes).
+    app.scene.hover_handle = app.scene.find_handle(app.mode, img, handle_r);
     app.scene.hover_node = if app.scene.hover_handle.is_some() {
         None
     } else {
-        app.scene.find_node(img, node_r)
+        app.scene.find_node(app.mode, img, node_r)
     };
 }
 
@@ -98,27 +101,14 @@ fn handle_drag(app: &mut App, resp: &egui::Response, x: &Xform, ctx: &egui::Cont
     }
 }
 
-/// Primary click with a path tool.
-///
-/// Priority, high to low, with the Road tool:
-///
-/// 1. Mid-draft → place the next point (or terminate if the click hit a
-///    node). Clicks on the road body are not interpreted as selection
-///    while a draft is active.
-/// 2. Empty draft, click on a node → start a new road there.
-/// 3. Empty draft, click inside a road body → select that segment.
-/// 4. Empty draft, click on empty canvas → start a new road there.
-///
-/// With the Pavement tool, only the node-snap and place behaviors apply;
-/// pavements don't have segments.
 fn handle_primary_click(app: &mut App, resp: &egui::Response, x: &Xform) {
     if !is_path_tool(app.tool) {
         return;
     }
     if resp.double_clicked_by(PointerButton::Primary) {
-        match app.tool {
-            Tool::Road => app.scene.finish_road(),
-            Tool::Pavement => app.scene.finish_pavement(),
+        match (app.mode, app.tool) {
+            (EditMode::Road, Tool::Road) => app.scene.finish_road(),
+            (EditMode::Sublayer, Tool::Pavement) => app.scene.finish_pavement(),
             _ => {}
         }
         return;
@@ -134,52 +124,38 @@ fn handle_primary_click(app: &mut App, resp: &egui::Response, x: &Xform) {
         app.status = "Set the scale first (fetch satellite or calibrate).".into();
         return;
     }
-    let snap = app.scene.find_node(img, x.screen_dist_to_image(NODE_HIT_RADIUS_PX));
+    let snap = app.scene.find_node(
+        app.mode,
+        img,
+        x.screen_dist_to_image(NODE_HIT_RADIUS_PX),
+    );
 
-    match app.tool {
-        Tool::Road => {
+    match (app.mode, app.tool) {
+        (EditMode::Road, Tool::Road) => {
             if !app.scene.current_road.is_empty() {
-                // Mid-draft: all clicks are placement.
                 app.scene.road_click(img, snap);
             } else if snap.is_some() {
-                // Empty draft, on a node: start there.
                 app.scene.deselect_segment();
                 app.scene.road_click(img, snap);
             } else if let Some(seg) = road_hit(app, img) {
-                // Empty draft, on a road body: select that segment.
                 app.scene.select_segment(seg.road, seg.segment);
             } else {
-                // Empty draft, on empty canvas: start a new road.
                 app.scene.deselect_segment();
                 app.scene.road_click(img, None);
             }
         }
-        Tool::Pavement => {
+        (EditMode::Sublayer, Tool::Pavement) => {
             app.scene.pavement_click(img, snap);
         }
         _ => {}
     }
 }
 
-/// Returns the road segment whose body contains `img_pos`.
-///
-/// Uses `Scene::segment_at`, which compares the distance from the click to
-/// the segment centerline against the segment's own half-width. Deeper
-/// hits (larger slack) win ties, so overlapping roads prefer the one
-/// you're more solidly inside.
 fn road_hit(app: &App, img_pos: eframe::egui::Pos2) -> Option<crate::scene::SegmentRef> {
     let ppm = app.px_per_m.unwrap_or(1.0);
     app.scene.segment_at(img_pos, ppm)
 }
 
-/// Secondary click with a path tool.
-///
-/// Priority:
-///
-/// 1. Draft in progress → finish it.
-/// 2. Selected segment → deselect (exit segment-edit mode).
-/// 3. Cursor over a node → delete that node.
-/// 4. Road tool, cursor over a road segment → insert an anchor there.
 fn handle_secondary_click(
     app: &mut App,
     resp: &egui::Response,
@@ -233,12 +209,15 @@ fn handle_secondary_click(
         return;
     }
 
-    if let Some(id) = app.scene.find_node(img, x.screen_dist_to_image(NODE_HIT_RADIUS_PX)) {
+    if let Some(id) = app
+        .scene
+        .find_node(app.mode, img, x.screen_dist_to_image(NODE_HIT_RADIUS_PX))
+    {
         app.scene.delete_node(id);
         return;
     }
 
-    if app.tool == Tool::Road {
+    if app.mode == EditMode::Road && app.tool == Tool::Road {
         if let Some((ri, seg_i, proj)) = app
             .scene
             .closest_road_segment(img, x.screen_dist_to_image(INSERT_HIT_RADIUS_PX))

@@ -18,7 +18,7 @@ pub struct App {
     pub scene: Scene,
 
     /// Which broad layer is being edited. Gates which tools are available
-    /// and which draft/pickup behaviors are active.
+    /// and which entities are hoverable, draggable, and rendered as handles.
     pub mode: EditMode,
 
     pub tool: Tool,
@@ -76,22 +76,34 @@ impl App {
     // Mode switching
     // ============================================================
 
-    /// Changes the active edit mode. If the current tool isn't valid for
-    /// the new mode, resets to the mode's default tool. Preserves drafts
-    /// (they'll be re-rendered if you switch back to their mode).
+    /// Changes the active edit mode.
+    ///
+    /// The tool is reset to the mode's default so that switching modes
+    /// always lands you on a productive tool. Without this, going
+    /// Roads → Details → Roads would strand you on Pan (since Pan is valid
+    /// in every mode and thus never gets reset by the "is this tool valid"
+    /// check alone), and node editing would silently stop working.
+    ///
+    /// Calibrate is preserved across mode switches because it's a stateful
+    /// flow — you're in the middle of clicking two points — and interrupting
+    /// it by browsing modes would lose your in-progress measurement.
     pub fn set_mode(&mut self, mode: EditMode) {
         if self.mode == mode {
             return;
         }
         self.mode = mode;
-        if !mode.allows_tool(self.tool) {
+
+        if self.tool != Tool::Calibrate {
             self.tool = mode.default_tool();
         }
-        // Clear transient interaction state that may reference the previous
-        // mode's entities.
+
+        // Clear transient interaction state that may reference entities
+        // from the previous mode.
         self.secondary_press = None;
         self.scene.hover_node = None;
         self.scene.hover_handle = None;
+        self.scene.dragging = None;
+        self.scene.dragging_handle = None;
         self.scene.selected_segment = None;
     }
 
@@ -203,11 +215,9 @@ impl App {
             self.scene.undo();
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-            match self.tool {
-                Tool::Road if self.mode == EditMode::Road => self.scene.finish_road(),
-                Tool::Pavement if matches!(self.mode, EditMode::Sublayer | EditMode::Road) => {
-                    self.scene.finish_pavement()
-                }
+            match (self.mode, self.tool) {
+                (EditMode::Road, Tool::Road) => self.scene.finish_road(),
+                (EditMode::Sublayer, Tool::Pavement) => self.scene.finish_pavement(),
                 _ => {}
             }
         }

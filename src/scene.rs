@@ -6,8 +6,8 @@ use std::collections::{HashMap, HashSet};
 use eframe::egui::{Pos2, Vec2};
 
 use crate::model::{
-    default_two_way, recompute_auto_handles, AnchorRef, CenterStyle, HandleRef, HandleSide, Lane,
-    Material, NodeGraph, NodeId, PathAnchor, PathOwner, Pavement, Road,
+    default_two_way, recompute_auto_handles, AnchorRef, CenterStyle, EditMode, HandleRef,
+    HandleSide, Lane, Material, NodeGraph, NodeId, PathAnchor, PathOwner, Pavement, Road,
 };
 
 /// Identifies a specific road segment: the span between anchors
@@ -25,14 +25,10 @@ pub struct Scene {
     pub current_road: Vec<PathAnchor>,
     pub current_pavement: Vec<PathAnchor>,
 
-    /// Cross-section for the *next* committed road.
     pub draft_lanes: Vec<Lane>,
-    /// Center-line style for the next committed road.
     pub center_style: CenterStyle,
-    /// Material for the next committed pavement shape.
     pub draft_material: Material,
 
-    /// Currently selected road segment, if any.
     pub selected_segment: Option<SegmentRef>,
 
     pub dragging: Option<NodeId>,
@@ -120,7 +116,23 @@ impl Scene {
         }
     }
 
-    pub fn find_node(&self, img_pt: Pos2, radius: f32) -> Option<NodeId> {
+    /// Finds the nearest node to `img_pt` within `radius` image pixels.
+    ///
+    /// `mode` filters which entity types are searched: Road mode sees only
+    /// road nodes, Sublayer mode sees only pavement nodes, and
+    /// Details/Decorations see nothing (those modes don't own node-bearing
+    /// entities yet). Without this filter, Sublayer nodes would be hoverable
+    /// and draggable while editing roads, and vice versa.
+    pub fn find_node(&self, mode: EditMode, img_pt: Pos2, radius: f32) -> Option<NodeId> {
+        let (search_roads, search_pavements) = match mode {
+            EditMode::Road => (true, false),
+            EditMode::Sublayer => (false, true),
+            EditMode::Details | EditMode::Decorations => (false, false),
+        };
+        if !search_roads && !search_pavements {
+            return None;
+        }
+
         let r2 = radius * radius;
         let mut best: Option<(NodeId, f32)> = None;
         let mut seen: HashSet<NodeId> = HashSet::new();
@@ -139,40 +151,61 @@ impl Scene {
             }
         };
 
-        for a in &self.current_road {
-            consider(a.node);
-        }
-        for a in &self.current_pavement {
-            consider(a.node);
-        }
-        for road in &self.roads {
-            for a in &road.anchors {
+        if search_roads {
+            for a in &self.current_road {
                 consider(a.node);
             }
+            for road in &self.roads {
+                for a in &road.anchors {
+                    consider(a.node);
+                }
+            }
         }
-        for pa in &self.pavements {
-            for a in &pa.anchors {
+        if search_pavements {
+            for a in &self.current_pavement {
                 consider(a.node);
+            }
+            for pa in &self.pavements {
+                for a in &pa.anchors {
+                    consider(a.node);
+                }
             }
         }
         best.map(|(id, _)| id)
     }
 
-    pub fn find_handle(&self, img_pt: Pos2, radius: f32) -> Option<HandleRef> {
+    /// Finds the nearest handle to `img_pt`, filtered by mode the same way
+    /// `find_node` is.
+    pub fn find_handle(&self, mode: EditMode, img_pt: Pos2, radius: f32) -> Option<HandleRef> {
+        let (search_roads, search_pavements) = match mode {
+            EditMode::Road => (true, false),
+            EditMode::Sublayer => (false, true),
+            EditMode::Details | EditMode::Decorations => (false, false),
+        };
+        if !search_roads && !search_pavements {
+            return None;
+        }
+
         let r2 = radius * radius;
-        for (i, road) in self.roads.iter().enumerate() {
-            for (ai, a) in road.anchors.iter().enumerate() {
-                if let Some(h) = handle_hit(&self.graph, a, PathOwner::Road(i), ai, img_pt, r2) {
-                    return Some(h);
+        if search_roads {
+            for (i, road) in self.roads.iter().enumerate() {
+                for (ai, a) in road.anchors.iter().enumerate() {
+                    if let Some(h) =
+                        handle_hit(&self.graph, a, PathOwner::Road(i), ai, img_pt, r2)
+                    {
+                        return Some(h);
+                    }
                 }
             }
         }
-        for (i, pa) in self.pavements.iter().enumerate() {
-            for (ai, a) in pa.anchors.iter().enumerate() {
-                if let Some(h) =
-                    handle_hit(&self.graph, a, PathOwner::Pavement(i), ai, img_pt, r2)
-                {
-                    return Some(h);
+        if search_pavements {
+            for (i, pa) in self.pavements.iter().enumerate() {
+                for (ai, a) in pa.anchors.iter().enumerate() {
+                    if let Some(h) =
+                        handle_hit(&self.graph, a, PathOwner::Pavement(i), ai, img_pt, r2)
+                    {
+                        return Some(h);
+                    }
                 }
             }
         }
