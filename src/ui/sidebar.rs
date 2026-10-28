@@ -1,20 +1,18 @@
-//! Right-hand side panel: cross-section editor and center-line picker.
+//! Right-hand side panel. Contents depend on the active edit mode:
 //!
-//! Two modes:
-//!
-//! * **Draft mode** — nothing is selected. The editor writes to
-//!   `Scene::draft_lanes` and `Scene::center_style`, which are what the
-//!   next committed road will use.
-//! * **Segment mode** — a road segment is selected. The editor writes to
-//!   that segment's override. A "Reset to road default" button drops the
-//!   override.
+//! * **Sublayer** — material picker (Asphalt / Concrete / Sidewalk / Grass).
+//! * **Roads** — cross-section editor and center-line picker, switching
+//!   between draft mode (nothing selected) and segment mode (a segment is
+//!   selected).
+//! * **Details** / **Decorations** — placeholder, since those modes have
+//!   no tools yet.
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 
 use crate::app::App;
 use crate::model::{
-    display_unit_to_meters, width_in_display_unit, CenterStyle, Direction, Lane, LaneKind,
-    SegmentStyle,
+    display_unit_to_meters, width_in_display_unit, CenterStyle, Direction, EditMode, Lane,
+    LaneKind, Material,
 };
 use crate::scene::SegmentRef;
 use crate::ui::paint::{paint_cross_section, paint_road_preview};
@@ -27,6 +25,7 @@ const CENTER_STYLES: &[CenterStyle] = &[
 ];
 
 const CENTER_ITEM_HEIGHT: f32 = 56.0;
+const MATERIAL_ITEM_HEIGHT: f32 = 48.0;
 const ITEM_PAD: f32 = 6.0;
 const CROSS_SECTION_HEIGHT: f32 = 56.0;
 
@@ -35,19 +34,96 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         .resizable(false)
         .default_width(300.0)
         .show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                if let Some(seg) = app.scene.selected_segment {
-                    segment_mode(app, ui, seg);
-                } else {
-                    draft_mode(app, ui);
-                }
+            egui::ScrollArea::vertical().show(ui, |ui| match app.mode {
+                EditMode::Sublayer => sublayer_sidebar(app, ui),
+                EditMode::Road => road_sidebar(app, ui),
+                EditMode::Details => placeholder_sidebar(
+                    ui,
+                    "Road details",
+                    "Crosswalks, stop lines, turn arrows, and above-road shapes will live here.",
+                ),
+                EditMode::Decorations => placeholder_sidebar(
+                    ui,
+                    "Decorations",
+                    "Trees, benches, shelters, and buildings will live here.",
+                ),
             });
         });
 }
 
 // ============================================================
-// Draft mode
+// Sublayer mode
 // ============================================================
+
+fn sublayer_sidebar(app: &mut App, ui: &mut egui::Ui) {
+    ui.add_space(8.0);
+    ui.heading("Base materials");
+    ui.add_space(2.0);
+    ui.label(
+        egui::RichText::new("Fill shapes with the selected material")
+            .color(Color32::from_gray(170))
+            .size(12.0),
+    );
+    ui.add_space(8.0);
+
+    for &mat in Material::all() {
+        material_item(app, ui, mat);
+        ui.add_space(6.0);
+    }
+}
+
+fn material_item(app: &mut App, ui: &mut egui::Ui, mat: Material) {
+    let selected = app.scene.draft_material == mat;
+    let size = Vec2::new(ui.available_width(), MATERIAL_ITEM_HEIGHT);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+
+    let bg = if selected {
+        Color32::from_rgb(54, 82, 124)
+    } else if resp.hovered() {
+        Color32::from_rgb(50, 50, 56)
+    } else {
+        Color32::from_rgb(38, 38, 42)
+    };
+    let border = if selected {
+        Stroke::new(1.5_f32, Color32::from_rgb(120, 170, 230))
+    } else {
+        Stroke::NONE
+    };
+    ui.painter().rect(rect, 4.0, bg, border);
+
+    // Color swatch on the left.
+    let swatch_size = 32.0;
+    let swatch_rect = Rect::from_min_size(
+        Pos2::new(rect.left() + ITEM_PAD + 2.0, rect.center().y - swatch_size / 2.0),
+        Vec2::splat(swatch_size),
+    );
+    ui.painter().rect(swatch_rect, 3.0, mat.color(), Stroke::NONE);
+
+    // Label to the right of the swatch.
+    ui.painter().text(
+        Pos2::new(swatch_rect.right() + 10.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        mat.label(),
+        FontId::proportional(14.0),
+        Color32::from_gray(225),
+    );
+
+    if resp.clicked() {
+        app.scene.draft_material = mat;
+    }
+}
+
+// ============================================================
+// Road mode
+// ============================================================
+
+fn road_sidebar(app: &mut App, ui: &mut egui::Ui) {
+    if let Some(seg) = app.scene.selected_segment {
+        segment_mode(app, ui, seg);
+    } else {
+        draft_mode(app, ui);
+    }
+}
 
 fn draft_mode(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(8.0);
@@ -60,12 +136,9 @@ fn draft_mode(app: &mut App, ui: &mut egui::Ui) {
     );
     ui.add_space(6.0);
 
-    // Snapshot the cross-section into locals so the borrow checker is
-    // happy while we edit. We write back at the end.
     let mut lanes = app.scene.draft_lanes.clone();
     let mut center = app.scene.center_style;
 
-    // Preview strip.
     let width = ui.available_width();
     let (rect, _) =
         ui.allocate_exact_size(Vec2::new(width, CROSS_SECTION_HEIGHT), Sense::hover());
@@ -87,13 +160,7 @@ fn draft_mode(app: &mut App, ui: &mut egui::Ui) {
     app.scene.center_style = center;
 }
 
-// ============================================================
-// Segment mode
-// ============================================================
-
 fn segment_mode(app: &mut App, ui: &mut egui::Ui, seg: SegmentRef) {
-    // Validate the selection first — it could be stale if the road was
-    // split or the road list changed shape.
     let Some(road) = app.scene.roads.get(seg.road) else {
         app.scene.selected_segment = None;
         return;
@@ -119,9 +186,6 @@ fn segment_mode(app: &mut App, ui: &mut egui::Ui, seg: SegmentRef) {
     );
     ui.add_space(6.0);
 
-    // Snapshot the segment's current effective style into locals, edit,
-    // then write back. Using a snapshot avoids holding a borrow on
-    // `app.scene.roads` across the UI calls.
     let (mut lanes, mut center) = {
         let style = app.scene.roads[seg.road].style_for_segment(seg.segment);
         (style.lanes.clone(), style.center)
@@ -160,7 +224,6 @@ fn segment_mode(app: &mut App, ui: &mut egui::Ui, seg: SegmentRef) {
             .size(11.0),
     );
 
-    // Write the edited cross-section back as an override.
     if let Some(road) = app.scene.roads.get_mut(seg.road) {
         let style = road.segment_override_mut(seg.segment);
         style.lanes = lanes;
@@ -169,11 +232,30 @@ fn segment_mode(app: &mut App, ui: &mut egui::Ui, seg: SegmentRef) {
 }
 
 // ============================================================
+// Placeholder modes
+// ============================================================
+
+fn placeholder_sidebar(ui: &mut egui::Ui, title: &str, description: &str) {
+    ui.add_space(8.0);
+    ui.heading(title);
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new(description)
+            .color(Color32::from_gray(170))
+            .size(12.0),
+    );
+    ui.add_space(12.0);
+    ui.label(
+        egui::RichText::new("Coming soon.")
+            .color(Color32::from_gray(150))
+            .italics(),
+    );
+}
+
+// ============================================================
 // Shared sub-editors
 // ============================================================
 
-/// Renders the lane rows. `id_salt` distinguishes the draft editor's
-/// widget IDs from the segment editor's so egui doesn't confuse them.
 fn lane_editor(ui: &mut egui::Ui, lanes: &mut Vec<Lane>, unit: crate::model::Unit, id_salt: &str) {
     let count = lanes.len();
     let mut to_remove: Option<usize> = None;
@@ -226,7 +308,6 @@ fn lane_editor(ui: &mut egui::Ui, lanes: &mut Vec<Lane>, unit: crate::model::Uni
             }
         });
 
-        // Apply back to the lane.
         let slot = &mut lanes[i];
         if slot.kind != kind {
             slot.kind = kind;
@@ -300,8 +381,3 @@ fn center_style_item(ui: &mut egui::Ui, current: &mut CenterStyle, style: Center
         *current = style;
     }
 }
-
-// Silence a false-positive warning about SegmentStyle being unused; it's
-// used implicitly via type inference in the segment editor's snapshots.
-#[allow(unused_imports)]
-use SegmentStyle as _SegmentStyleAlias;

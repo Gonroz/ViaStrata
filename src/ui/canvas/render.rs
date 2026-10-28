@@ -47,7 +47,7 @@ pub fn draw(
     for pa in &app.scene.pavements {
         let polyline_img = tessellate(&pa.anchors, &app.scene.graph, true, SAMPLES_PER_SEGMENT);
         let polyline: Vec<Pos2> = polyline_img.iter().map(|&p| x.to_screen(p)).collect();
-        paint_pavement(painter, &polyline);
+        paint_pavement(painter, &polyline, pa.material.color());
     }
 
     // --- Road bodies (pass 1) -----------------------------------------
@@ -73,12 +73,10 @@ pub fn draw(
 
     // --- Draft pavement ------------------------------------------------
     //
-    // Only drawn in the modes where Pavement is a valid tool. In Details
-    // or Decorations mode a half-drawn pavement would be confusing since
-    // you can't continue it there.
-    if matches!(app.mode, EditMode::Sublayer | EditMode::Road)
-        && !app.scene.current_pavement.is_empty()
-    {
+    // Only drawn in Sublayer mode, since the Pavement tool isn't available
+    // anywhere else. The draft is filled with the current material color
+    // (at reduced alpha) so the user can see what they're about to commit.
+    if app.mode == EditMode::Sublayer && !app.scene.current_pavement.is_empty() {
         let anchors = app.scene.current_pavement.clone();
         let polyline_img = tessellate(&anchors, &app.scene.graph, false, SAMPLES_PER_SEGMENT);
         let mut screen: Vec<Pos2> = polyline_img.iter().map(|&p| x.to_screen(p)).collect();
@@ -99,6 +97,12 @@ pub fn draw(
                 screen.push(x.to_screen(first));
             }
         }
+        // Fill at reduced opacity so the user sees the material color
+        // without it feeling committed.
+        if screen.len() >= 3 {
+            paint_pavement(painter, &screen, app.scene.draft_material.preview_color());
+        }
+        // Blue outline on top so the in-progress state is obvious.
         painter.add(egui::Shape::line(
             screen,
             Stroke::new(2.0_f32, Color32::from_rgb(120, 170, 230)),
@@ -106,9 +110,6 @@ pub fn draw(
     }
 
     // --- Draft road ----------------------------------------------------
-    //
-    // Only drawn in Road mode. A half-drawn road in another mode would
-    // suggest you can continue it, which you can't until you switch back.
     if app.mode == EditMode::Road && !app.scene.current_road.is_empty() {
         let anchors = app.scene.current_road.clone();
         let polyline_img = tessellate(&anchors, &app.scene.graph, false, SAMPLES_PER_SEGMENT);

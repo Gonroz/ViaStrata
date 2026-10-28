@@ -7,7 +7,7 @@ use eframe::egui::{Pos2, Vec2};
 
 use crate::model::{
     default_two_way, recompute_auto_handles, AnchorRef, CenterStyle, HandleRef, HandleSide, Lane,
-    NodeGraph, NodeId, PathAnchor, PathOwner, Pavement, Road,
+    Material, NodeGraph, NodeId, PathAnchor, PathOwner, Pavement, Road,
 };
 
 /// Identifies a specific road segment: the span between anchors
@@ -29,9 +29,10 @@ pub struct Scene {
     pub draft_lanes: Vec<Lane>,
     /// Center-line style for the next committed road.
     pub center_style: CenterStyle,
+    /// Material for the next committed pavement shape.
+    pub draft_material: Material,
 
-    /// Currently selected road segment, if any. When set, the sidebar edits
-    /// this segment's override instead of the draft cross-section.
+    /// Currently selected road segment, if any.
     pub selected_segment: Option<SegmentRef>,
 
     pub dragging: Option<NodeId>,
@@ -51,6 +52,7 @@ impl Default for Scene {
 
             draft_lanes: default_two_way(),
             center_style: CenterStyle::YellowSolid,
+            draft_material: Material::Asphalt,
 
             selected_segment: None,
 
@@ -75,8 +77,6 @@ impl Scene {
         }
     }
 
-    /// Clears the current selection, cleaning up any override that ended up
-    /// identical to the road default.
     pub fn deselect_segment(&mut self) {
         if let Some(seg) = self.selected_segment.take() {
             if let Some(road) = self.roads.get_mut(seg.road) {
@@ -230,12 +230,6 @@ impl Scene {
         best.map(|(ri, i, p, _)| (ri, i, p))
     }
 
-    /// Hit-tests a click against road bodies, using per-segment widths.
-    /// `px_per_m` is passed in because geometry is in image pixels and
-    /// widths are in meters — the caller owns the conversion factor.
-    /// Returns the segment whose interior contains the point, preferring
-    /// the one with the deepest slack (i.e. the point is most solidly
-    /// inside).
     pub fn segment_at(&self, pos: Pos2, px_per_m: f32) -> Option<SegmentRef> {
         let mut best: Option<(SegmentRef, f32)> = None;
         for (ri, road) in self.roads.iter().enumerate() {
@@ -340,8 +334,6 @@ impl Scene {
         }
         self.hover_handle = None;
         self.dragging_handle = None;
-        // If the selected segment's road was split, the selection is
-        // meaningless now.
         self.selected_segment = None;
     }
 
@@ -438,7 +430,10 @@ impl Scene {
         self.current_pavement.clear();
 
         if deduped.len() >= 3 {
-            self.pavements.push(Pavement { anchors: deduped });
+            self.pavements.push(Pavement {
+                anchors: deduped,
+                material: self.draft_material,
+            });
             self.refresh_auto_handles();
         } else {
             for a in deduped {
@@ -612,8 +607,6 @@ fn split_roads_on_node(roads: Vec<Road>, id: NodeId) -> Vec<Road> {
                     anchors: piece,
                     lanes: road.lanes.clone(),
                     center: road.center,
-                    // Overrides are keyed by segment index, which is
-                    // meaningless after a split. Drop them.
                     segment_overrides: HashMap::new(),
                 });
             }
@@ -651,13 +644,19 @@ fn split_pavements_on_node(pavements: Vec<Pavement>, id: NodeId) -> Vec<Pavement
         for &pos in &positions {
             let piece = pa.anchors[start..pos].to_vec();
             if piece.len() >= 3 {
-                out.push(Pavement { anchors: piece });
+                out.push(Pavement {
+                    anchors: piece,
+                    material: pa.material,
+                });
             }
             start = pos + 1;
         }
         let tail = pa.anchors[start..].to_vec();
         if tail.len() >= 3 {
-            out.push(Pavement { anchors: tail });
+            out.push(Pavement {
+                anchors: tail,
+                material: pa.material,
+            });
         }
     }
     out

@@ -10,7 +10,6 @@ const PAINT_WHITE: Color32 = Color32::from_rgb(238, 238, 238);
 const PAINT_YELLOW: Color32 = Color32::from_rgb(240, 200, 40);
 const SELECTION_BLUE: Color32 = Color32::from_rgba_premultiplied(80, 160, 255, 90);
 
-/// How a boundary between two adjacent lanes is marked.
 #[derive(Clone, Copy)]
 enum BoundaryMark {
     None,
@@ -36,8 +35,12 @@ fn classify_boundary(a: &Lane, b: &Lane, center: CenterStyle) -> BoundaryMark {
     BoundaryMark::SolidWhite
 }
 
-/// Fills a closed pavement polygon with asphalt.
-pub fn paint_pavement(painter: &Painter, polygon: &[Pos2]) {
+/// Fills a closed polygon with `color` using ear-clip triangulation.
+///
+/// `polygon` may or may not repeat its first point at the end; this
+/// function trims a duplicate. Skips the fill entirely if ear-clipping
+/// can't fully triangulate the shape.
+pub fn paint_pavement(painter: &Painter, polygon: &[Pos2], color: Color32) {
     let poly: &[Pos2] = if polygon.len() >= 2 && polygon[0] == polygon[polygon.len() - 1] {
         &polygon[..polygon.len() - 1]
     } else {
@@ -56,7 +59,7 @@ pub fn paint_pavement(painter: &Painter, polygon: &[Pos2]) {
                 mesh.vertices.push(egui::epaint::Vertex {
                     pos: poly[idx as usize],
                     uv: egui::epaint::WHITE_UV,
-                    color: ASPHALT,
+                    color,
                 });
             }
             mesh.indices.push(base);
@@ -67,14 +70,11 @@ pub fn paint_pavement(painter: &Painter, polygon: &[Pos2]) {
     }
     let mut outline: Vec<Pos2> = poly.to_vec();
     outline.push(poly[0]);
-    painter.add(Shape::line(outline, Stroke::new(1.0_f32, ASPHALT)));
+    painter.add(Shape::line(outline, Stroke::new(1.0_f32, color)));
 }
 
 /// Draws a road segment body as a triangle-strip mesh, using per-sample
-/// widths. This is what makes taper work: the strip's left and right edges
-/// move in and out along the segment as the width changes.
-///
-/// `widths[i]` is the *full* width at sample `i`, in screen pixels.
+/// widths.
 pub fn paint_road_body(painter: &Painter, pts: &[Pos2], widths: &[f32]) {
     if pts.len() < 2 || widths.len() != pts.len() {
         return;
@@ -83,8 +83,6 @@ pub fn paint_road_body(painter: &Painter, pts: &[Pos2], widths: &[f32]) {
     let mut mesh = egui::Mesh::default();
     let n = pts.len();
 
-    // Compute the tangent at each sample once so left/right offsets use
-    // the same normal as the centerline.
     for i in 0..n - 1 {
         let tangent_i = tangent(pts, i);
         let tangent_next = tangent(pts, i + 1);
@@ -112,7 +110,6 @@ pub fn paint_road_body(painter: &Painter, pts: &[Pos2], widths: &[f32]) {
                 color: ASPHALT,
             });
         }
-        // Two triangles: (left_i, right_i, left_next) and (right_i, right_next, left_next).
         mesh.indices.extend_from_slice(&[
             base,
             base + 1,
@@ -126,8 +123,6 @@ pub fn paint_road_body(painter: &Painter, pts: &[Pos2], widths: &[f32]) {
     painter.add(Shape::Mesh(mesh));
 }
 
-/// Paints coloured fills for lanes whose kind defines a tint, using
-/// per-sample widths. Draws a strip per tinted lane, matching the taper.
 pub fn paint_lane_tints_tapered(
     painter: &Painter,
     pts: &[Pos2],
@@ -142,8 +137,6 @@ pub fn paint_lane_tints_tapered(
         return;
     }
 
-    // Cumulative fraction of the total native width at each boundary.
-    // Boundary `k` sits at the left edge of lane `k`.
     let mut fractions = Vec::with_capacity(style.lanes.len() + 1);
     let mut acc = 0.0;
     fractions.push(0.0);
@@ -159,7 +152,6 @@ pub fn paint_lane_tints_tapered(
         let color = Color32::from_rgb(r, g, b);
         let f_left = fractions[i];
         let f_right = fractions[i + 1];
-        // Per-sample offsets for the two edges.
         let mut left_offsets = Vec::with_capacity(pts.len());
         let mut right_offsets = Vec::with_capacity(pts.len());
         for w in widths {
@@ -168,13 +160,10 @@ pub fn paint_lane_tints_tapered(
         }
         let left_line = spline::offset_polyline_variable(pts, &left_offsets);
         let right_line = spline::offset_polyline_variable(pts, &right_offsets);
-        // Build a mesh strip from left_line to right_line.
         paint_strip(painter, &left_line, &right_line, color);
     }
 }
 
-/// Builds a quad strip between two polylines of the same length. Used for
-/// lane tints, where the two edges taper together.
 fn paint_strip(painter: &Painter, left: &[Pos2], right: &[Pos2], color: Color32) {
     if left.len() < 2 || left.len() != right.len() {
         return;
@@ -201,8 +190,6 @@ fn paint_strip(painter: &Painter, left: &[Pos2], right: &[Pos2], color: Color32)
     painter.add(Shape::Mesh(mesh));
 }
 
-/// Edge lines, lane dividers, and center line, drawn with per-sample
-/// widths so markings taper along with the body.
 pub fn paint_road_markings_tapered(
     painter: &Painter,
     pts: &[Pos2],
@@ -217,13 +204,10 @@ pub fn paint_road_markings_tapered(
         return;
     }
 
-    // Average width determines line thickness, so a uniformly narrow road
-    // doesn't draw hairline markings.
     let avg_w = widths.iter().copied().sum::<f32>() / widths.len() as f32;
     let line_w = (avg_w * 0.02).max(1.0);
     let center_w = (avg_w * 0.025).max(1.0);
 
-    // Boundary fractions in native space, as before.
     let mut fractions = Vec::with_capacity(style.lanes.len() + 1);
     let mut acc = 0.0;
     fractions.push(0.0);
@@ -232,13 +216,10 @@ pub fn paint_road_markings_tapered(
         fractions.push(acc / native);
     }
 
-    // Helper: variable offset for a boundary at fraction `f`.
     let offsets_for = |f: f32| -> Vec<f32> {
         widths.iter().map(|w| (f - 0.5) * w).collect()
     };
 
-    // Edge lines at fractions 0 and 1, unless the endmost lane is curb-
-    // adjacent (parking or median).
     let left_ok = style.lanes.first().map(|l| l.kind.has_edge_line()).unwrap_or(false);
     let right_ok = style.lanes.last().map(|l| l.kind.has_edge_line()).unwrap_or(false);
     if left_ok {
@@ -252,7 +233,6 @@ pub fn paint_road_markings_tapered(
         painter.add(Shape::line(line, Stroke::new(line_w, PAINT_WHITE)));
     }
 
-    // Internal boundaries.
     for i in 0..style.lanes.len().saturating_sub(1) {
         let f = fractions[i + 1];
         let mark = classify_boundary(&style.lanes[i], &style.lanes[i + 1], style.center);
@@ -280,7 +260,6 @@ pub fn paint_road_markings_tapered(
     }
 }
 
-/// Draws a center line at boundary fraction `f` with per-sample offsets.
 fn draw_center_at(
     painter: &Painter,
     pts: &[Pos2],
@@ -320,22 +299,18 @@ fn draw_center_at(
     }
 }
 
-/// Semi-transparent highlight over a selected segment, plus a thin outline.
 pub fn paint_segment_highlight(painter: &Painter, pts: &[Pos2], widths: &[f32]) {
     if pts.len() < 2 || widths.len() != pts.len() {
         return;
     }
-    paint_road_body_with_color(painter, pts, widths, SELECTION_BLUE, 1.5);
+    paint_road_body_with_color(painter, pts, widths, SELECTION_BLUE);
 }
 
-/// Like `paint_road_body` but with a caller-chosen color and no reliance
-/// on the global ASPHALT constant. Used for the selection overlay.
 fn paint_road_body_with_color(
     painter: &Painter,
     pts: &[Pos2],
     widths: &[f32],
     color: Color32,
-    _outline_width: f32,
 ) {
     if pts.len() < 2 || widths.len() != pts.len() {
         return;
@@ -379,8 +354,6 @@ fn paint_road_body_with_color(
     painter.add(Shape::Mesh(mesh));
 }
 
-/// Tangent at polyline vertex `i`. Mirrors `spline::tangent_at`, which is
-/// private; duplicated here to avoid a public API surface just for this.
 fn tangent(pts: &[Pos2], i: usize) -> eframe::egui::Vec2 {
     let n = pts.len();
     if n < 2 {
@@ -405,7 +378,6 @@ fn tangent(pts: &[Pos2], i: usize) -> eframe::egui::Vec2 {
     }
 }
 
-/// Preview thumbnail for the center-line style pickers.
 pub fn paint_road_preview(painter: &Painter, rect: Rect, center: CenterStyle) {
     if rect.width() < 12.0 || rect.height() < 8.0 {
         return;
@@ -429,14 +401,7 @@ pub fn paint_road_preview(painter: &Painter, rect: Rect, center: CenterStyle) {
         }
     }
     if center != CenterStyle::None {
-        draw_center_at(
-            painter,
-            &pts,
-            &[width, width],
-            0.5,
-            center_w,
-            center,
-        );
+        draw_center_at(painter, &pts, &[width, width], 0.5, center_w, center);
     } else {
         let line = spline::offset_polyline(&pts, 0.0);
         painter.extend(Shape::dashed_line(
@@ -448,8 +413,6 @@ pub fn paint_road_preview(painter: &Painter, rect: Rect, center: CenterStyle) {
     }
 }
 
-/// Cross-section preview used in the sidebar. Draws the given lanes as a
-/// horizontal strip, including tints, markings, and direction arrows.
 pub fn paint_cross_section(
     painter: &Painter,
     rect: Rect,
@@ -499,7 +462,6 @@ pub fn paint_cross_section(
     }
 }
 
-/// Imagery credit in the bottom-right corner of the canvas.
 pub fn paint_attribution(painter: &Painter, rect: Rect, text: &str) {
     let pos = rect.right_bottom() - vec2(8.0, 6.0);
     let font = egui::FontId::proportional(12.0);
