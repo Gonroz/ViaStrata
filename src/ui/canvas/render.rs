@@ -8,7 +8,7 @@ use super::input::NODE_HIT_RADIUS_PX;
 use super::Xform;
 use crate::app::App;
 use crate::model::{
-    tessellate, AnchorRef, HandleRef, HandleSide, NodeId, PathAnchor, PathOwner, Tool,
+    tessellate, AnchorRef, EditMode, HandleRef, HandleSide, NodeId, PathAnchor, PathOwner, Tool,
 };
 use crate::spline;
 use crate::ui::paint::{
@@ -21,8 +21,6 @@ const HANDLE_RADIUS: f32 = 4.0;
 const SHARED_RING_RADIUS: f32 = HANDLE_RADIUS + 3.5;
 const DIR_HANDLE_RADIUS: f32 = 3.5;
 
-/// Asphalt colour. Mirrors the constant in `paint.rs`; duplicated here so
-/// the joint-fill circles match without exposing the paint-layer constant.
 const ASPHALT: Color32 = Color32::from_rgb(58, 58, 62);
 
 pub fn draw(
@@ -74,7 +72,13 @@ pub fn draw(
     }
 
     // --- Draft pavement ------------------------------------------------
-    if !app.scene.current_pavement.is_empty() {
+    //
+    // Only drawn in the modes where Pavement is a valid tool. In Details
+    // or Decorations mode a half-drawn pavement would be confusing since
+    // you can't continue it there.
+    if matches!(app.mode, EditMode::Sublayer | EditMode::Road)
+        && !app.scene.current_pavement.is_empty()
+    {
         let anchors = app.scene.current_pavement.clone();
         let polyline_img = tessellate(&anchors, &app.scene.graph, false, SAMPLES_PER_SEGMENT);
         let mut screen: Vec<Pos2> = polyline_img.iter().map(|&p| x.to_screen(p)).collect();
@@ -102,7 +106,10 @@ pub fn draw(
     }
 
     // --- Draft road ----------------------------------------------------
-    if !app.scene.current_road.is_empty() {
+    //
+    // Only drawn in Road mode. A half-drawn road in another mode would
+    // suggest you can continue it, which you can't until you switch back.
+    if app.mode == EditMode::Road && !app.scene.current_road.is_empty() {
         let anchors = app.scene.current_road.clone();
         let polyline_img = tessellate(&anchors, &app.scene.graph, false, SAMPLES_PER_SEGMENT);
         let mut screen: Vec<Pos2> = polyline_img.iter().map(|&p| x.to_screen(p)).collect();
@@ -148,9 +155,6 @@ pub fn draw(
     }
 }
 
-/// Computes screen-space samples and per-sample widths for one road
-/// segment. Samples come from tessellating the segment's Bézier; widths
-/// come from lerping between the two anchor widths.
 pub fn segment_screen_samples(
     app: &App,
     x: &Xform,
@@ -192,21 +196,6 @@ pub fn segment_screen_samples(
     (samples_screen, widths_screen)
 }
 
-/// Draws asphalt for every segment of a road, plus joint fills at anchors.
-///
-/// # Why every interior anchor gets a fill
-///
-/// Each segment is a separate mesh strip. At a shared anchor the two
-/// strips meet, but the *tangent* at that anchor is computed independently
-/// for each side (backward difference on segment A's last sample, forward
-/// difference on segment B's first sample). For a smooth anchor those
-/// agree in direction but differ in the finite-difference estimate by a
-/// fraction of a pixel, so the corner vertices don't quite coincide and a
-/// hairline crack appears. A filled circle at the anchor covers it.
-///
-/// Endpoints are only filled when they belong to a shared node. A loose
-/// road end must stay butt-capped — a fill circle there would round off
-/// the road end, undoing the "straight road ends" behavior.
 fn paint_road_whole_body(
     app: &App,
     painter: &egui::Painter,
@@ -243,7 +232,6 @@ fn paint_road_whole_body(
     }
 }
 
-/// Draws lane tints and markings for every segment of a road.
 fn paint_road_whole_markings(
     app: &App,
     painter: &egui::Painter,

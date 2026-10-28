@@ -1,14 +1,4 @@
 //! Application state and the top-level update loop.
-//!
-//! `App` is the outer shell: camera, tool selection, calibration, image
-//! loading, tile fetching. Everything about the *design being drawn* —
-//! nodes, roads, pavements, drafts, and the interaction state that goes
-//! with them — lives in `App::scene`, a `Scene` struct.
-//!
-//! Operations that touch both layers (loading a new image resets the
-//! scene; a fetch installs an image and sets the scale) live here, on
-//! `App`. Everything else is a method on whichever layer owns the data
-//! it manipulates.
 
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
@@ -16,36 +6,29 @@ use eframe::egui::{self, Pos2};
 
 use crate::geo::parse_latlon;
 use crate::imagery::{fetch_imagery, Fetched, Source};
-use crate::model::{Tool, Unit};
+use crate::model::{EditMode, Tool, Unit};
 use crate::scene::Scene;
 use crate::ui;
 use crate::ui::canvas::View;
 
-/// Upper bound on the loaded image's longest side.
 const MAX_TEX: u32 = 8192;
 
-/// All application state.
 pub struct App {
-    // Camera
     pub view: View,
-
-    // The design
     pub scene: Scene,
 
-    // Tools + scale
+    /// Which broad layer is being edited. Gates which tools are available
+    /// and which draft/pickup behaviors are active.
+    pub mode: EditMode,
+
     pub tool: Tool,
     pub unit: Unit,
     pub calib_pts: Vec<Pos2>,
     pub calib_dist: f32,
     pub px_per_m: Option<f32>,
 
-    /// Where the secondary mouse button was last pressed. See
-    /// `input::handle_secondary_click` for why we track this ourselves.
-    /// Lives on `App` rather than `Scene` because it's general input state,
-    /// not design state.
     pub secondary_press: Option<Pos2>,
 
-    // Satellite fetch
     pub coord_text: String,
     pub source: Source,
     pub tile_z: u32,
@@ -64,7 +47,9 @@ impl Default for App {
             view: View::default(),
             scene: Scene::default(),
 
-            tool: Tool::Pan,
+            mode: EditMode::Road,
+
+            tool: Tool::Road,
             unit: Unit::Feet,
             calib_pts: Vec::new(),
             calib_dist: 100.0,
@@ -72,7 +57,6 @@ impl Default for App {
 
             secondary_press: None,
 
-            // Prefilled so the app is useful the moment it opens.
             coord_text: "42.922367, -78.867269".into(),
             source: Source::Esri,
             tile_z: 19,
@@ -89,15 +73,32 @@ impl Default for App {
 
 impl App {
     // ============================================================
+    // Mode switching
+    // ============================================================
+
+    /// Changes the active edit mode. If the current tool isn't valid for
+    /// the new mode, resets to the mode's default tool. Preserves drafts
+    /// (they'll be re-rendered if you switch back to their mode).
+    pub fn set_mode(&mut self, mode: EditMode) {
+        if self.mode == mode {
+            return;
+        }
+        self.mode = mode;
+        if !mode.allows_tool(self.tool) {
+            self.tool = mode.default_tool();
+        }
+        // Clear transient interaction state that may reference the previous
+        // mode's entities.
+        self.secondary_press = None;
+        self.scene.hover_node = None;
+        self.scene.hover_handle = None;
+        self.scene.selected_segment = None;
+    }
+
+    // ============================================================
     // Image loading & fetch
     // ============================================================
 
-    /// Installs an image as the canvas background and resets the drawing
-    /// state. Roads, pavements, and nodes are cleared along with the scale,
-    /// because their pixel coordinates refer to the old image.
-    ///
-    /// The actual texture upload is delegated to `View::install_image`,
-    /// which also schedules a one-shot fit-to-window.
     pub fn set_base(&mut self, ctx: &egui::Context, img: &image::RgbaImage) {
         self.view.install_image(ctx, img);
 
@@ -105,8 +106,6 @@ impl App {
         self.px_per_m = None;
         self.scene.clear_all_paths();
         self.secondary_press = None;
-        // Re-set by `apply_fetched` when we came from a fetch; open-image
-        // mode intentionally leaves this blank.
         self.attribution.clear();
     }
 
@@ -178,6 +177,7 @@ impl App {
     fn apply_fetched(&mut self, ctx: &egui::Context, f: Fetched) {
         self.set_base(ctx, &f.img);
         self.px_per_m = Some(f.px_per_m);
+        self.mode = EditMode::Road;
         self.tool = Tool::Road;
         self.attribution = self.source.attribution().to_string();
         let unit_mpp = f.m_per_px / self.unit.to_m() as f64;
@@ -195,10 +195,6 @@ impl App {
     // Keyboard
     // ============================================================
 
-    /// Keyboard shortcuts, ignored while typing in a text field.
-    ///
-    /// Node deletion is handled in the canvas instead of here, because it
-    /// needs the hover state that only the canvas computes.
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         if ctx.wants_keyboard_input() {
             return;
@@ -208,8 +204,10 @@ impl App {
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
             match self.tool {
-                Tool::Road => self.scene.finish_road(),
-                Tool::Pavement => self.scene.finish_pavement(),
+                Tool::Road if self.mode == EditMode::Road => self.scene.finish_road(),
+                Tool::Pavement if matches!(self.mode, EditMode::Sublayer | EditMode::Road) => {
+                    self.scene.finish_pavement()
+                }
                 _ => {}
             }
         }
@@ -232,8 +230,6 @@ impl eframe::App for App {
         self.handle_shortcuts(ctx);
         ui::canvas::view::apply_wasd(self, ctx);
 
-        // Panel order matters in egui: top/bottom panels first, then side
-        // panels, then the central panel takes whatever is left.
         ui::toolbar::show(self, ctx);
         ui::toolbar::show_status(self, ctx);
         ui::sidebar::show(self, ctx);

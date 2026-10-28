@@ -4,7 +4,7 @@ use eframe::egui::{self, Color32};
 
 use crate::app::App;
 use crate::imagery::Source;
-use crate::model::{Tool, Unit};
+use crate::model::{EditMode, Tool, Unit};
 
 pub fn show(app: &mut App, ctx: &egui::Context) {
     egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
@@ -20,21 +20,36 @@ pub fn show_status(app: &App, ctx: &egui::Context) {
     });
 }
 
+/// Row 1: file, mode selector, tool selector, units, scale.
 fn image_row(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         if ui.button("Open image…").clicked() {
             app.open_image(ctx);
         }
         ui.separator();
-        ui.selectable_value(&mut app.tool, Tool::Pan, "Pan");
-        ui.selectable_value(&mut app.tool, Tool::Calibrate, "Calibrate scale");
-        ui.selectable_value(&mut app.tool, Tool::Road, "Road");
-        ui.selectable_value(&mut app.tool, Tool::Pavement, "Pavement");
+
+        // Mode selector. Selected mode is highlighted; clicking a different
+        // one calls `set_mode`, which may reset the tool.
+        for mode in EditMode::all() {
+            let is_current = app.mode == *mode;
+            if ui.selectable_label(is_current, mode.label()).clicked() && !is_current {
+                app.set_mode(*mode);
+            }
+        }
         ui.separator();
+
+        // Tool selector, filtered by mode.
+        for &tool in app.mode.tools() {
+            let label = app.mode.tool_label(tool);
+            ui.selectable_value(&mut app.tool, tool, label);
+        }
+        ui.separator();
+
         ui.label("Units:");
         ui.selectable_value(&mut app.unit, Unit::Feet, "ft");
         ui.selectable_value(&mut app.unit, Unit::Meters, "m");
         ui.separator();
+
         match app.px_per_m {
             Some(s) => {
                 let px_per_unit = s * app.unit.to_m();
@@ -47,6 +62,7 @@ fn image_row(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
     });
 }
 
+/// Row 2: coordinates + satellite source settings.
 fn location_row(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.label("Location:");
@@ -88,8 +104,7 @@ fn location_row(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
     });
 }
 
-/// Row 3: controls for the active tool. Lane layout and center-line style
-/// now live in the sidebar; this row only carries actions.
+/// Row 3: controls for the active tool.
 fn tool_row(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal(|ui| match app.tool {
         Tool::Calibrate => {
@@ -144,6 +159,14 @@ fn tool_row(app: &mut App, ui: &mut egui::Ui) {
         }
         Tool::Pan => {
             ui.label("Middle-drag or WASD to pan, scroll to zoom.");
+            if app.mode == EditMode::Details || app.mode == EditMode::Decorations {
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(format!("{} tools coming soon", app.mode.label()))
+                        .color(Color32::from_gray(150))
+                        .italics(),
+                );
+            }
         }
     });
 }
