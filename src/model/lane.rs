@@ -131,7 +131,11 @@ pub enum Direction {
 }
 
 /// One lane in a road's cross-section.
-#[derive(Clone, Copy, Debug)]
+///
+/// `PartialEq` is derived so `SegmentStyle` can compare a segment's
+/// effective override against the road default in
+/// `Road::segment_equals_default`.
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Lane {
     pub kind: LaneKind,
     pub width_m: f32,

@@ -1,18 +1,5 @@
 //! The scene: everything about the design being drawn, independent of
 //! camera, tool selection, and fetch state.
-//!
-//! A `Scene` owns:
-//!
-//! * The node graph — every distinct point the design is built from.
-//! * The roads and pavements drawn on it.
-//! * The in-progress drafts, including the cross-section for the next road.
-//! * Per-scene interaction state (which node or handle is hovered or
-//!   being dragged).
-//!
-//! Splitting this out of `App` keeps the design state together and
-//! narrows `App` to camera, tools, and network. It also opens the door to
-//! multiple scenes later — before/after comparisons, projects with
-//! several locations — without fighting `App` for ownership.
 
 use std::collections::{HashMap, HashSet};
 
@@ -23,31 +10,33 @@ use crate::model::{
     NodeGraph, NodeId, PathAnchor, PathOwner, Pavement, Road,
 };
 
-/// All design data plus per-scene interaction state.
+/// Identifies a specific road segment: the span between anchors
+/// `segment` and `segment + 1` of road `road`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SegmentRef {
+    pub road: usize,
+    pub segment: usize,
+}
+
 pub struct Scene {
-    // ----- Data ------------------------------------------------------
     pub graph: NodeGraph,
     pub roads: Vec<Road>,
     pub pavements: Vec<Pavement>,
     pub current_road: Vec<PathAnchor>,
     pub current_pavement: Vec<PathAnchor>,
 
-    /// Cross-section for the *next* committed road. Cloned into each new
-    /// `Road` at commit time, so existing roads keep their own lane list
-    /// even if the user edits this for the next one.
+    /// Cross-section for the *next* committed road.
     pub draft_lanes: Vec<Lane>,
-    /// Center-line style for the next committed road. Same copy-on-commit
-    /// semantics as `draft_lanes`.
+    /// Center-line style for the next committed road.
     pub center_style: CenterStyle,
 
-    // ----- Interaction -----------------------------------------------
-    /// The node the user is currently dragging, if any.
+    /// Currently selected road segment, if any. When set, the sidebar edits
+    /// this segment's override instead of the draft cross-section.
+    pub selected_segment: Option<SegmentRef>,
+
     pub dragging: Option<NodeId>,
-    /// The node under the cursor this frame, if any.
     pub hover_node: Option<NodeId>,
-    /// The handle the user is currently dragging, if any.
     pub dragging_handle: Option<HandleRef>,
-    /// The handle under the cursor this frame, if any.
     pub hover_handle: Option<HandleRef>,
 }
 
@@ -63,6 +52,8 @@ impl Default for Scene {
             draft_lanes: default_two_way(),
             center_style: CenterStyle::YellowSolid,
 
+            selected_segment: None,
+
             dragging: None,
             hover_node: None,
             dragging_handle: None,
@@ -72,6 +63,30 @@ impl Default for Scene {
 }
 
 impl Scene {
+    // ============================================================
+    // Segment selection
+    // ============================================================
+
+    pub fn select_segment(&mut self, road: usize, segment: usize) {
+        if let Some(r) = self.roads.get(road) {
+            if segment < r.num_segments() {
+                self.selected_segment = Some(SegmentRef { road, segment });
+            }
+        }
+    }
+
+    /// Clears the current selection, cleaning up any override that ended up
+    /// identical to the road default.
+    pub fn deselect_segment(&mut self) {
+        if let Some(seg) = self.selected_segment.take() {
+            if let Some(road) = self.roads.get_mut(seg.road) {
+                if road.segment_equals_default(seg.segment) {
+                    road.segment_overrides.remove(&seg.segment);
+                }
+            }
+        }
+    }
+
     // ============================================================
     // Queries
     // ============================================================
@@ -105,10 +120,6 @@ impl Scene {
         }
     }
 
-    /// Finds the nearest node to `img_pt` within `radius` image pixels.
-    ///
-    /// Draft nodes are tested first so that, on a tie, a point the user
-    /// just placed wins over one buried under an older path.
     pub fn find_node(&self, img_pt: Pos2, radius: f32) -> Option<NodeId> {
         let r2 = radius * radius;
         let mut best: Option<(NodeId, f32)> = None;
@@ -147,8 +158,6 @@ impl Scene {
         best.map(|(id, _)| id)
     }
 
-    /// Finds the nearest handle to `img_pt`. Roads are checked before
-    /// pavements so a road handle wins over a coincident pavement handle.
     pub fn find_handle(&self, img_pt: Pos2, radius: f32) -> Option<HandleRef> {
         let r2 = radius * radius;
         for (i, road) in self.roads.iter().enumerate() {
@@ -170,7 +179,6 @@ impl Scene {
         None
     }
 
-    /// Nodes referenced by two or more paths — get a joint fill and a ring.
     pub fn shared_nodes(&self) -> HashSet<NodeId> {
         let mut counts: HashMap<NodeId, usize> = HashMap::new();
         for road in &self.roads {
@@ -196,8 +204,6 @@ impl Scene {
             .collect()
     }
 
-    /// Closest committed-road segment to `pos`, returning
-    /// `(road_index, segment_start_index, projected_point)`.
     pub fn closest_road_segment(
         &self,
         pos: Pos2,
@@ -222,6 +228,34 @@ impl Scene {
             }
         }
         best.map(|(ri, i, p, _)| (ri, i, p))
+    }
+
+    /// Hit-tests a click against road bodies, using per-segment widths.
+    /// `px_per_m` is passed in because geometry is in image pixels and
+    /// widths are in meters — the caller owns the conversion factor.
+    /// Returns the segment whose interior contains the point, preferring
+    /// the one with the deepest slack (i.e. the point is most solidly
+    /// inside).
+    pub fn segment_at(&self, pos: Pos2, px_per_m: f32) -> Option<SegmentRef> {
+        let mut best: Option<(SegmentRef, f32)> = None;
+        for (ri, road) in self.roads.iter().enumerate() {
+            let pts = self.road_positions(road);
+            for i in 0..pts.len().saturating_sub(1) {
+                let a = pts[i];
+                let b = pts[i + 1];
+                let proj = project_point_to_segment(pos, a, b);
+                let d = (proj - pos).length();
+                let half_w = road.segment_width_m(i) * px_per_m / 2.0;
+                if d <= half_w {
+                    let slack = half_w - d;
+                    match best {
+                        Some((_, bs)) if bs >= slack => {}
+                        _ => best = Some((SegmentRef { road: ri, segment: i }, slack)),
+                    }
+                }
+            }
+        }
+        best.map(|(s, _)| s)
     }
 
     // ============================================================
@@ -268,8 +302,6 @@ impl Scene {
         }
     }
 
-    /// Alt-drag on a node: pull out symmetric direction handles from every
-    /// anchor that references it.
     pub fn pull_out_handles(&mut self, node: NodeId, delta: Vec2) {
         for road in &mut self.roads {
             for a in &mut road.anchors {
@@ -308,6 +340,9 @@ impl Scene {
         }
         self.hover_handle = None;
         self.dragging_handle = None;
+        // If the selected segment's road was split, the selection is
+        // meaningless now.
+        self.selected_segment = None;
     }
 
     fn remove_if_orphan(&mut self, id: NodeId) {
@@ -375,10 +410,6 @@ impl Scene {
         self.hover_handle = None;
     }
 
-    /// Commits the current road draft into `roads` if it has at least two
-    /// distinct consecutive anchors. The cross-section is cloned from
-    /// `draft_lanes`, so the user's edits apply to the next road without
-    /// retroactively changing existing ones.
     pub fn finish_road(&mut self) {
         let deduped = dedup_anchors(&self.current_road);
         self.current_road.clear();
@@ -388,6 +419,7 @@ impl Scene {
                 anchors: deduped,
                 lanes: self.draft_lanes.clone(),
                 center: self.center_style,
+                segment_overrides: HashMap::new(),
             });
             self.refresh_auto_handles();
         } else {
@@ -486,6 +518,7 @@ impl Scene {
         self.hover_node = None;
         self.dragging_handle = None;
         self.hover_handle = None;
+        self.selected_segment = None;
     }
 
     pub fn clear_all_paths(&mut self) {
@@ -498,6 +531,7 @@ impl Scene {
         self.hover_node = None;
         self.dragging_handle = None;
         self.hover_handle = None;
+        self.selected_segment = None;
     }
 }
 
@@ -578,6 +612,9 @@ fn split_roads_on_node(roads: Vec<Road>, id: NodeId) -> Vec<Road> {
                     anchors: piece,
                     lanes: road.lanes.clone(),
                     center: road.center,
+                    // Overrides are keyed by segment index, which is
+                    // meaningless after a split. Drop them.
+                    segment_overrides: HashMap::new(),
                 });
             }
             start = pos + 1;
@@ -588,6 +625,7 @@ fn split_roads_on_node(roads: Vec<Road>, id: NodeId) -> Vec<Road> {
                 anchors: tail,
                 lanes: road.lanes.clone(),
                 center: road.center,
+                segment_overrides: HashMap::new(),
             });
         }
     }

@@ -16,6 +16,6 @@ pub use path::{
     recompute_auto_handles, tessellate, AnchorRef, HandleRef, HandleSide, PathAnchor, PathOwner,
 };
 pub use pavement::Pavement;
-pub use road::{CenterStyle, Road};
+pub use road::{CenterStyle, Road, SegmentStyle};
 pub use tool::Tool;
 pub use unit::Unit;

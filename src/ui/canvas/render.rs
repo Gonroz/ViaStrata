@@ -10,14 +10,20 @@ use crate::app::App;
 use crate::model::{
     tessellate, AnchorRef, HandleRef, HandleSide, NodeId, PathAnchor, PathOwner, Tool,
 };
+use crate::spline;
 use crate::ui::paint::{
-    paint_attribution, paint_lane_tints, paint_pavement, paint_road_asphalt, paint_road_markings,
+    paint_attribution, paint_lane_tints_tapered, paint_pavement, paint_road_body,
+    paint_road_markings_tapered, paint_segment_highlight,
 };
 
 const SAMPLES_PER_SEGMENT: usize = 12;
 const HANDLE_RADIUS: f32 = 4.0;
 const SHARED_RING_RADIUS: f32 = HANDLE_RADIUS + 3.5;
 const DIR_HANDLE_RADIUS: f32 = 3.5;
+
+/// Asphalt colour. Mirrors the constant in `paint.rs`; duplicated here so
+/// the joint-fill circles match without exposing the paint-layer constant.
+const ASPHALT: Color32 = Color32::from_rgb(58, 58, 62);
 
 pub fn draw(
     app: &App,
@@ -46,38 +52,25 @@ pub fn draw(
         paint_pavement(painter, &polyline);
     }
 
-    // --- Road asphalt (pass 1: body + joint fills) --------------------
+    // --- Road bodies (pass 1) -----------------------------------------
     for road in &app.scene.roads {
-        let polyline_img = tessellate(&road.anchors, &app.scene.graph, false, SAMPLES_PER_SEGMENT);
-        let screen: Vec<Pos2> = polyline_img.iter().map(|&p| x.to_screen(p)).collect();
-        let w = road.total_width_m() * ppm * x.zoom();
-        let joints: Vec<Pos2> = road
-            .anchors
-            .iter()
-            .filter(|a| shared.contains(&a.node))
-            .filter_map(|a| app.scene.graph.pos(a.node))
-            .map(|p| x.to_screen(p))
-            .collect();
-        paint_road_asphalt(painter, &screen, w, &joints);
+        paint_road_whole_body(app, painter, x, road, ppm, &shared);
     }
 
-    // --- Road tints and markings (pass 2) -----------------------------
-    //
-    // Split into two sub-passes so a lane tint never covers a marking
-    // drawn on an earlier road. In practice tints stop at the road's own
-    // anchors and don't extend across shared nodes, but two-pass is
-    // cheap and correct.
+    // --- Tints + markings (pass 2) ------------------------------------
     for road in &app.scene.roads {
-        let polyline_img = tessellate(&road.anchors, &app.scene.graph, false, SAMPLES_PER_SEGMENT);
-        let screen: Vec<Pos2> = polyline_img.iter().map(|&p| x.to_screen(p)).collect();
-        let w = road.total_width_m() * ppm * x.zoom();
-        paint_lane_tints(painter, &screen, w, &road.lanes);
+        paint_road_whole_markings(app, painter, x, road, ppm);
     }
-    for road in &app.scene.roads {
-        let polyline_img = tessellate(&road.anchors, &app.scene.graph, false, SAMPLES_PER_SEGMENT);
-        let screen: Vec<Pos2> = polyline_img.iter().map(|&p| x.to_screen(p)).collect();
-        let w = road.total_width_m() * ppm * x.zoom();
-        paint_road_markings(painter, &screen, w, &road.lanes, road.center);
+
+    // --- Selection highlight ------------------------------------------
+    if let Some(seg) = app.scene.selected_segment {
+        if let Some(road) = app.scene.roads.get(seg.road) {
+            if seg.segment < road.num_segments() {
+                let (pts_screen, widths_screen) =
+                    segment_screen_samples(app, x, road, seg.segment, ppm);
+                paint_segment_highlight(painter, &pts_screen, &widths_screen);
+            }
+        }
     }
 
     // --- Draft pavement ------------------------------------------------
@@ -123,23 +116,14 @@ pub fn draw(
             screen.push(x.to_screen(preview));
         }
         let w = crate::model::total_width_m(&app.scene.draft_lanes) * ppm * x.zoom();
-        let joints: Vec<Pos2> = app
-            .scene
-            .current_road
-            .iter()
-            .filter(|a| shared.contains(&a.node))
-            .filter_map(|a| app.scene.graph.pos(a.node))
-            .map(|p| x.to_screen(p))
-            .collect();
-        paint_road_asphalt(painter, &screen, w, &joints);
-        paint_lane_tints(painter, &screen, w, &app.scene.draft_lanes);
-        paint_road_markings(
-            painter,
-            &screen,
-            w,
-            &app.scene.draft_lanes,
-            app.scene.center_style,
-        );
+        let widths = vec![w; screen.len()];
+        let style = crate::model::SegmentStyle {
+            lanes: app.scene.draft_lanes.clone(),
+            center: app.scene.center_style,
+        };
+        paint_road_body(painter, &screen, &widths);
+        paint_lane_tints_tapered(painter, &screen, &widths, &style);
+        paint_road_markings_tapered(painter, &screen, &widths, &style);
     }
 
     // --- Node handles + direction handles -----------------------------
@@ -161,6 +145,120 @@ pub fn draw(
 
     if !app.attribution.is_empty() {
         paint_attribution(painter, rect, &app.attribution);
+    }
+}
+
+/// Computes screen-space samples and per-sample widths for one road
+/// segment. Samples come from tessellating the segment's Bézier; widths
+/// come from lerping between the two anchor widths.
+pub fn segment_screen_samples(
+    app: &App,
+    x: &Xform,
+    road: &crate::model::Road,
+    seg_i: usize,
+    ppm: f32,
+) -> (Vec<Pos2>, Vec<f32>) {
+    let anchor_widths = road.anchor_widths_m();
+    let Some(a) = road.anchors.get(seg_i) else {
+        return (Vec::new(), Vec::new());
+    };
+    let Some(b) = road.anchors.get(seg_i + 1) else {
+        return (Vec::new(), Vec::new());
+    };
+    let Some(p_a) = app.scene.graph.pos(a.node) else {
+        return (Vec::new(), Vec::new());
+    };
+    let Some(p_b) = app.scene.graph.pos(b.node) else {
+        return (Vec::new(), Vec::new());
+    };
+
+    let c1 = p_a + a.out_handle;
+    let c2 = p_b + b.in_handle;
+    let samples_img = spline::tessellate_bezier(p_a, c1, c2, p_b, SAMPLES_PER_SEGMENT);
+    let samples_screen: Vec<Pos2> = samples_img.iter().map(|&p| x.to_screen(p)).collect();
+
+    let w_start_m = anchor_widths.get(seg_i).copied().unwrap_or(0.0);
+    let w_end_m = anchor_widths.get(seg_i + 1).copied().unwrap_or(0.0);
+    let n = samples_screen.len();
+    let denom = n.saturating_sub(1).max(1) as f32;
+    let widths_screen: Vec<f32> = (0..n)
+        .map(|i| {
+            let t = i as f32 / denom;
+            let w_m = w_start_m + (w_end_m - w_start_m) * t;
+            w_m * ppm * x.zoom()
+        })
+        .collect();
+
+    (samples_screen, widths_screen)
+}
+
+/// Draws asphalt for every segment of a road, plus joint fills at anchors.
+///
+/// # Why every interior anchor gets a fill
+///
+/// Each segment is a separate mesh strip. At a shared anchor the two
+/// strips meet, but the *tangent* at that anchor is computed independently
+/// for each side (backward difference on segment A's last sample, forward
+/// difference on segment B's first sample). For a smooth anchor those
+/// agree in direction but differ in the finite-difference estimate by a
+/// fraction of a pixel, so the corner vertices don't quite coincide and a
+/// hairline crack appears. A filled circle at the anchor covers it.
+///
+/// Endpoints are only filled when they belong to a shared node. A loose
+/// road end must stay butt-capped — a fill circle there would round off
+/// the road end, undoing the "straight road ends" behavior.
+fn paint_road_whole_body(
+    app: &App,
+    painter: &egui::Painter,
+    x: &Xform,
+    road: &crate::model::Road,
+    ppm: f32,
+    shared: &HashSet<NodeId>,
+) {
+    let anchor_widths = road.anchor_widths_m();
+
+    for seg_i in 0..road.num_segments() {
+        let (pts_screen, widths_screen) = segment_screen_samples(app, x, road, seg_i, ppm);
+        if pts_screen.len() < 2 {
+            continue;
+        }
+        paint_road_body(painter, &pts_screen, &widths_screen);
+    }
+
+    let last = road.anchors.len().saturating_sub(1);
+    for (k, anchor) in road.anchors.iter().enumerate() {
+        let is_endpoint = k == 0 || k == last;
+        if is_endpoint && !shared.contains(&anchor.node) {
+            continue;
+        }
+        let Some(p_img) = app.scene.graph.pos(anchor.node) else {
+            continue;
+        };
+        let w_m = anchor_widths.get(k).copied().unwrap_or(0.0);
+        let w_px = w_m * ppm * x.zoom();
+        if w_px <= 0.0 {
+            continue;
+        }
+        painter.circle_filled(x.to_screen(p_img), w_px / 2.0, ASPHALT);
+    }
+}
+
+/// Draws lane tints and markings for every segment of a road.
+fn paint_road_whole_markings(
+    app: &App,
+    painter: &egui::Painter,
+    x: &Xform,
+    road: &crate::model::Road,
+    ppm: f32,
+) {
+    for seg_i in 0..road.num_segments() {
+        let style = road.style_for_segment(seg_i);
+        let (pts_screen, widths_screen) = segment_screen_samples(app, x, road, seg_i, ppm);
+        if pts_screen.len() < 2 {
+            continue;
+        }
+        paint_lane_tints_tapered(painter, &pts_screen, &widths_screen, &style);
+        paint_road_markings_tapered(painter, &pts_screen, &widths_screen, &style);
     }
 }
 

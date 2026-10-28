@@ -4,26 +4,21 @@
 //! that used to live here for roads is now derived from Bézier form: the
 //! auto-handle computation in `model::path::recompute_auto_handles`
 //! converts a Catmull-Rom tangent into the equivalent Bézier control
-//! points, so a smooth road still has the same shape but goes through the
-//! same rendering code as pavements.
+//! points.
 //!
-//! Also here: `offset_polyline`, used by lane-marking rendering, and
-//! `ear_clip`, used by pavement fill.
+//! Also here: `offset_polyline` (constant-offset, used by lane markings),
+//! `offset_polyline_variable` (variable-offset, used by tapered roads),
+//! and `ear_clip` (used by pavement fill).
 
 use eframe::egui::{Pos2, Vec2};
 
 /// Evaluates a cubic Bézier at parameter `t` in `[0, 1]`.
-///
-/// `c1` and `c2` are the two control points; `p0` and `p3` are the endpoints.
-/// The curve passes through `p0` at `t=0` and `p3` at `t=1`, and its tangent
-/// at `p0` points toward `c1` (scaled by 3×, which is the standard Bézier
-/// derivative).
 pub fn cubic_bezier_point(p0: Pos2, c1: Pos2, c2: Pos2, p3: Pos2, t: f32) -> Pos2 {
     let mt = 1.0 - t;
     let mt2 = mt * mt;
     let t2 = t * t;
 
-    let a = mt2 * mt; // (1-t)^3
+    let a = mt2 * mt;
     let b = 3.0 * mt2 * t;
     let c = 3.0 * mt * t2;
     let d = t2 * t;
@@ -34,73 +29,108 @@ pub fn cubic_bezier_point(p0: Pos2, c1: Pos2, c2: Pos2, p3: Pos2, t: f32) -> Pos
     )
 }
 
-/// Offsets a polyline laterally by `offset` units (positive = to the left
-/// when walking along the polyline in drawing order, in a y-down coordinate
-/// system).
+/// Tessellates a single Bézier segment into a polyline with `samples + 1`
+/// points, including both endpoints.
 ///
-/// Used to draw lane markings on a polyline parallel to the road centerline.
+/// Separate from the anchor-based `tessellate` because tapered rendering
+/// needs per-segment polylines and per-segment widths, not one merged
+/// polyline with a single width.
+pub fn tessellate_bezier(
+    p0: Pos2,
+    c1: Pos2,
+    c2: Pos2,
+    p3: Pos2,
+    samples: usize,
+) -> Vec<Pos2> {
+    let samples = samples.max(1);
+    let mut out = Vec::with_capacity(samples + 1);
+    out.push(p0);
+    for s in 1..=samples {
+        let t = s as f32 / samples as f32;
+        out.push(cubic_bezier_point(p0, c1, c2, p3, t));
+    }
+    out
+}
+
+/// Computes the per-vertex tangent of a polyline.
 ///
-/// The offset is *naive* — each vertex moves along its own normal, so sharp
-/// corners self-intersect. That is fine here because the input is always a
-/// densely tessellated spline: consecutive vertices are close enough that
-/// the naive offset is visually indistinguishable from a proper miter.
+/// Forward difference at the start, backward difference at the end,
+/// average of the two neighbouring unit vectors elsewhere. Returns a
+/// zero-length vector at any vertex whose neighbours coincide.
+fn tangent_at(pts: &[Pos2], i: usize) -> Vec2 {
+    let n = pts.len();
+    if n < 2 {
+        return Vec2::ZERO;
+    }
+    if i == 0 {
+        pts[1] - pts[0]
+    } else if i == n - 1 {
+        pts[n - 1] - pts[n - 2]
+    } else {
+        let a = pts[i] - pts[i - 1];
+        let b = pts[i + 1] - pts[i];
+        let al = a.length();
+        let bl = b.length();
+        if al > 1e-6 && bl > 1e-6 {
+            a / al + b / bl
+        } else if al > 1e-6 {
+            a
+        } else {
+            b
+        }
+    }
+}
+
+/// Offsets a polyline laterally by a constant `offset`.
 pub fn offset_polyline(pts: &[Pos2], offset: f32) -> Vec<Pos2> {
     if pts.len() < 2 {
         return pts.to_vec();
     }
-    let n = pts.len();
-    let mut out = Vec::with_capacity(n);
-
-    for i in 0..n {
-        let tangent: Vec2 = if i == 0 {
-            pts[1] - pts[0]
-        } else if i == n - 1 {
-            pts[n - 1] - pts[n - 2]
-        } else {
-            let a = pts[i] - pts[i - 1];
-            let b = pts[i + 1] - pts[i];
-            let al = a.length();
-            let bl = b.length();
-            if al > 1e-6 && bl > 1e-6 {
-                a / al + b / bl
-            } else if al > 1e-6 {
-                a
-            } else {
-                b
-            }
-        };
-
+    let mut out = Vec::with_capacity(pts.len());
+    for i in 0..pts.len() {
+        let tangent = tangent_at(pts, i);
         let len = tangent.length();
         if len < 1e-6 {
             out.push(pts[i]);
             continue;
         }
-
         let t = tangent / len;
         let normal = Vec2::new(-t.y, t.x);
         out.push(pts[i] + normal * offset);
     }
+    out
+}
 
+/// Offsets a polyline laterally by a per-sample distance.
+///
+/// `offsets[i]` is the lateral offset at `pts[i]`. Used by tapered roads,
+/// where the offset of a lane boundary grows or shrinks along the segment.
+/// `offsets` must be the same length as `pts`.
+pub fn offset_polyline_variable(pts: &[Pos2], offsets: &[f32]) -> Vec<Pos2> {
+    debug_assert_eq!(pts.len(), offsets.len());
+    if pts.len() < 2 || offsets.len() != pts.len() {
+        return pts.to_vec();
+    }
+    let mut out = Vec::with_capacity(pts.len());
+    for i in 0..pts.len() {
+        let tangent = tangent_at(pts, i);
+        let len = tangent.length();
+        if len < 1e-6 {
+            out.push(pts[i]);
+            continue;
+        }
+        let t = tangent / len;
+        let normal = Vec2::new(-t.y, t.x);
+        out.push(pts[i] + normal * offsets[i]);
+    }
     out
 }
 
 /// Triangulates a simple polygon into a list of triangle indices.
 ///
-/// Uses the classic ear-clipping algorithm: repeatedly find a convex vertex
-/// ("ear") whose triangle contains no other polygon vertex, cut it off, and
-/// recurse on the remainder. Works on any simple polygon — convex or
-/// concave — but not self-intersecting.
-///
-/// Returns indices into `points`. If the polygon is degenerate (fewer than
-/// three points, all collinear, or self-intersecting), returns an empty or
-/// partial list rather than looping forever.
-///
-/// # Caller contract
-///
-/// The input must not repeat its first point at the end. A duplicated
-/// vertex creates a zero-length edge, which the "is this an ear?" test
-/// treats as having zero area and rejects, causing the algorithm to bail
-/// partway through. `paint_pavement` trims the duplicate before calling.
+/// Uses ear clipping. Works on simple polygons — convex or concave, but
+/// not self-intersecting. `points` must not repeat its first point at the
+/// end; `paint_pavement` trims the duplicate before calling.
 pub fn ear_clip(points: &[Pos2]) -> Vec<[u32; 3]> {
     let n = points.len();
     if n < 3 {
@@ -118,10 +148,6 @@ pub fn ear_clip(points: &[Pos2]) -> Vec<[u32; 3]> {
     let ccw = signed_area > 0.0;
 
     let mut triangles: Vec<[u32; 3]> = Vec::with_capacity(n.saturating_sub(2));
-
-    // Bound iterations: each successful clip removes one vertex, so a
-    // simple polygon needs exactly n-2 clips. If we exceed n * n attempts,
-    // something is wrong (self-intersecting input) and we bail.
     let mut safety = n * n;
 
     while indices.len() > 3 && safety > 0 {
@@ -138,14 +164,12 @@ pub fn ear_clip(points: &[Pos2]) -> Vec<[u32; 3]> {
             let b = points[cur];
             let c = points[next];
 
-            // Convex corner in the polygon's winding direction?
             let cross = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
             let convex = if ccw { cross > 0.0 } else { cross < 0.0 };
             if !convex {
                 continue;
             }
 
-            // No other vertex may lie inside the ear triangle.
             let mut contains_other = false;
             for (k, &other) in indices.iter().enumerate() {
                 if k == i || other == prev || other == cur || other == next {
@@ -167,8 +191,6 @@ pub fn ear_clip(points: &[Pos2]) -> Vec<[u32; 3]> {
         }
 
         if !clipped {
-            // No ear found. Degenerate or self-intersecting; stop rather
-            // than loop forever.
             break;
         }
     }
@@ -180,11 +202,6 @@ pub fn ear_clip(points: &[Pos2]) -> Vec<[u32; 3]> {
     triangles
 }
 
-/// Tests whether `p` lies inside triangle `(a, b, c)`.
-///
-/// Uses the sign of the cross product on each edge. Works for either
-/// winding because we accept a point as inside if all three edge tests
-/// agree, regardless of whether they are all positive or all negative.
 fn point_in_triangle(p: Pos2, a: Pos2, b: Pos2, c: Pos2) -> bool {
     let d1 = (p.x - b.x) * (a.y - b.y) - (a.x - b.x) * (p.y - b.y);
     let d2 = (p.x - c.x) * (b.y - c.y) - (b.x - c.x) * (p.y - c.y);

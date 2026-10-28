@@ -6,17 +6,9 @@ use super::Xform;
 use crate::app::App;
 use crate::model::{PathAnchor, Tool};
 
-/// Screen-space hit radius for anchors.
 pub(crate) const NODE_HIT_RADIUS_PX: f32 = 10.0;
-
-/// Screen-space hit radius for handle dots. Slightly smaller than the
-/// anchor radius so an anchor wins over its own handles if they overlap.
 const HANDLE_HIT_RADIUS_PX: f32 = 8.0;
-
-/// Screen-space hit radius for right-click-to-insert on a road segment.
 const INSERT_HIT_RADIUS_PX: f32 = 14.0;
-
-/// Movement tolerance for our hand-rolled right-click detection.
 const SECONDARY_CLICK_MAX_MOVE_PX: f32 = 8.0;
 
 pub fn handle(app: &mut App, resp: &egui::Response, x: &Xform, ctx: &egui::Context) {
@@ -68,20 +60,7 @@ fn handle_hover(app: &mut App, resp: &egui::Response, x: &Xform) {
     };
 }
 
-/// Latches drags on primary press. Applies motion per frame and clears on
-/// release.
-///
-/// # Modifier keys
-///
-/// * **Plain drag on an anchor**: moves the anchor and its handles along
-///   with it.
-/// * **Alt-drag on an anchor**: pulls out symmetric direction handles
-///   instead of moving the anchor. This is how a pavement corner becomes a
-///   smooth point.
-/// * **Alt-drag on a handle**: breaks the tangent symmetry, letting the two
-///   handles point independently.
 fn handle_drag(app: &mut App, resp: &egui::Response, x: &Xform, ctx: &egui::Context) {
-    // Start
     if is_path_tool(app.tool)
         && ctx.input(|i| i.pointer.primary_pressed())
         && resp.hovered()
@@ -95,7 +74,6 @@ fn handle_drag(app: &mut App, resp: &egui::Response, x: &Xform, ctx: &egui::Cont
         }
     }
 
-    // Continue
     if resp.dragged_by(PointerButton::Primary) {
         let delta = ctx.input(|i| i.pointer.delta());
         if delta != Vec2::ZERO {
@@ -114,13 +92,25 @@ fn handle_drag(app: &mut App, resp: &egui::Response, x: &Xform, ctx: &egui::Cont
         }
     }
 
-    // End
     if !ctx.input(|i| i.pointer.primary_down()) {
         app.scene.dragging = None;
         app.scene.dragging_handle = None;
     }
 }
 
+/// Primary click with a path tool.
+///
+/// Priority, high to low, with the Road tool:
+///
+/// 1. Mid-draft → place the next point (or terminate if the click hit a
+///    node). Clicks on the road body are not interpreted as selection
+///    while a draft is active.
+/// 2. Empty draft, click on a node → start a new road there.
+/// 3. Empty draft, click inside a road body → select that segment.
+/// 4. Empty draft, click on empty canvas → start a new road there.
+///
+/// With the Pavement tool, only the node-snap and place behaviors apply;
+/// pavements don't have segments.
 fn handle_primary_click(app: &mut App, resp: &egui::Response, x: &Xform) {
     if !is_path_tool(app.tool) {
         return;
@@ -145,26 +135,51 @@ fn handle_primary_click(app: &mut App, resp: &egui::Response, x: &Xform) {
         return;
     }
     let snap = app.scene.find_node(img, x.screen_dist_to_image(NODE_HIT_RADIUS_PX));
+
     match app.tool {
-        Tool::Road => app.scene.road_click(img, snap),
-        Tool::Pavement => app.scene.pavement_click(img, snap),
+        Tool::Road => {
+            if !app.scene.current_road.is_empty() {
+                // Mid-draft: all clicks are placement.
+                app.scene.road_click(img, snap);
+            } else if snap.is_some() {
+                // Empty draft, on a node: start there.
+                app.scene.deselect_segment();
+                app.scene.road_click(img, snap);
+            } else if let Some(seg) = road_hit(app, img) {
+                // Empty draft, on a road body: select that segment.
+                app.scene.select_segment(seg.road, seg.segment);
+            } else {
+                // Empty draft, on empty canvas: start a new road.
+                app.scene.deselect_segment();
+                app.scene.road_click(img, None);
+            }
+        }
+        Tool::Pavement => {
+            app.scene.pavement_click(img, snap);
+        }
         _ => {}
     }
 }
 
-/// Secondary click with a path tool. Three cases, in priority order:
+/// Returns the road segment whose body contains `img_pos`.
 ///
-/// 1. A draft is in progress -> finish it.
-/// 2. No draft, cursor over a node -> delete that node.
-/// 3. No draft, cursor over a road segment (Road tool only) -> insert a new
-///    anchor there.
+/// Uses `Scene::segment_at`, which compares the distance from the click to
+/// the segment centerline against the segment's own half-width. Deeper
+/// hits (larger slack) win ties, so overlapping roads prefer the one
+/// you're more solidly inside.
+fn road_hit(app: &App, img_pos: eframe::egui::Pos2) -> Option<crate::scene::SegmentRef> {
+    let ppm = app.px_per_m.unwrap_or(1.0);
+    app.scene.segment_at(img_pos, ppm)
+}
+
+/// Secondary click with a path tool.
 ///
-/// # Why this doesn't use `Response::clicked_by`
+/// Priority:
 ///
-/// egui's built-in click detection requires the cursor to be at *exactly*
-/// the same position on press and release. Real mouse input jitters by a
-/// pixel or two, so we do our own detection: record the press position,
-/// compare to the release, accept anything within `SECONDARY_CLICK_MAX_MOVE_PX`.
+/// 1. Draft in progress → finish it.
+/// 2. Selected segment → deselect (exit segment-edit mode).
+/// 3. Cursor over a node → delete that node.
+/// 4. Road tool, cursor over a road segment → insert an anchor there.
 fn handle_secondary_click(
     app: &mut App,
     resp: &egui::Response,
@@ -213,6 +228,10 @@ fn handle_secondary_click(
         app.scene.finish_pavement();
         return;
     }
+    if app.scene.selected_segment.is_some() {
+        app.scene.deselect_segment();
+        return;
+    }
 
     if let Some(id) = app.scene.find_node(img, x.screen_dist_to_image(NODE_HIT_RADIUS_PX)) {
         app.scene.delete_node(id);
@@ -228,9 +247,6 @@ fn handle_secondary_click(
             app.scene.roads[ri]
                 .anchors
                 .insert(seg_i + 1, PathAnchor::new(new_id));
-            // The old endpoint anchors on either side of the new one now
-            // have a neighbour in a different direction; let their auto
-            // tangents recompute so the curve smooths through the split.
             if let Some(a) = app.scene.roads[ri].anchors.get_mut(seg_i) {
                 a.auto = true;
             }
